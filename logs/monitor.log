@@ -1,0 +1,437 @@
+2026-03-18 23:34:01  INFO      ============================================================
+2026-03-18 23:34:01  INFO        Job Monitor starting (DRY RUN)
+2026-03-18 23:34:01  INFO      ============================================================
+2026-03-18 23:34:01  INFO      Config file 'config.json' not found, using defaults.
+2026-03-18 23:34:01  INFO      API usage this month: 0 calls
+2026-03-18 23:34:01  INFO      Loaded Google credentials from credentials.json file.
+2026-03-18 23:34:01  INFO      Loaded 39 URLs from E:\Github\Job-automate\links.txt
+2026-03-18 23:34:04  INFO      🆕  New URL tracked: https://www.systemsltd.com/careers/
+2026-03-18 23:34:07  INFO      🆕  New URL tracked: https://arbisoft.com/careers
+2026-03-18 23:34:08  INFO      🆕  New URL tracked: https://arbisoft.hirestream.io/careers/
+2026-03-18 23:34:10  INFO      🆕  New URL tracked: https://devsinc.com/careers
+2026-03-18 23:34:12  INFO      🆕  New URL tracked: https://www.10pearls.com/careers
+2026-03-18 23:34:19  INFO      🆕  New URL tracked: https://www.netsoltech.com/careers
+2026-03-18 23:34:22  INFO      🆕  New URL tracked: https://www.contour-software.com/careers
+2026-03-18 23:34:25  INFO      🆕  New URL tracked: https://www.confiz.com/careers
+2026-03-18 23:34:26  INFO      🆕  New URL tracked: https://careers.tkxel.com/
+2026-03-18 23:34:28  INFO      🆕  New URL tracked: https://www.techlogix.com/careers
+2026-03-18 23:34:33  INFO      🆕  New URL tracked: https://www.folio3.com/careers
+2026-03-18 23:34:36  INFO      🆕  New URL tracked: https://www.nextbridge.com/careers
+2026-03-18 23:34:39  INFO      🆕  New URL tracked: https://strategic-systems-international.breezy.hr/
+2026-03-18 23:34:40  INFO      🆕  New URL tracked: https://www.invozone.com/careers/
+2026-03-18 23:34:45  INFO      🆕  New URL tracked: https://www.purelogics.net/careers/
+2026-03-18 23:34:50  INFO      🆕  New URL tracked: https://gomotive.com/careers/
+2026-03-18 23:34:53  INFO      🆕  New URL tracked: https://dubizzle.applytojob.com/apply
+2026-03-18 23:34:55  INFO      🆕  New URL tracked: https://tajir.app/careers
+2026-03-18 23:34:56  INFO      🆕  New URL tracked: https://jobs.careem.com/
+2026-03-18 23:34:58  INFO      🆕  New URL tracked: https://www.afiniti.com/careers
+2026-03-18 23:35:03  INFO      🆕  New URL tracked: https://retailo.net/careers/
+2026-03-18 23:35:03  INFO      🆕  New URL tracked: https://www.sastaticket.pk/pages/career
+2026-03-18 23:35:06  INFO      🆕  New URL tracked: https://www.bazaartech.com/careers/
+2026-03-18 23:35:06  INFO      🆕  New URL tracked: https://careers.daraz.com/
+2026-03-18 23:35:08  INFO      🆕  New URL tracked: https://www.aitomation.com/careers/
+2026-03-18 23:35:11  INFO      🆕  New URL tracked: https://www.venturedive.com/careers/
+2026-03-18 23:35:16  INFO      🆕  New URL tracked: https://www.cubix.co/careers
+2026-03-18 23:35:16  INFO      🆕  New URL tracked: https://www.nisum.com/careers
+2026-03-18 23:35:18  INFO      🆕  New URL tracked: https://www.sadapay.pk/careers/
+2026-03-18 23:35:18  INFO      🆕  New URL tracked: https://www.nayapay.com/careers
+2026-03-18 23:35:29  ERROR     Request error for https://www.arfasoftech.com/careers — HTTPSConnectionPool(host='www.arfasoftech.com', port=443): Max retries exceeded with url: /careers (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x00000184DC0779D0>: Failed to resolve 'www.arfasoftech.com' ([Errno 11001] getaddrinfo failed)"))
+2026-03-18 23:35:41  ERROR     Request error for https://infinitybits.io/careers — HTTPSConnectionPool(host='infinitybits.io', port=443): Max retries exceeded with url: /careers (Caused by NameResolutionError("<urllib3.connection.HTTPSConnection object at 0x00000184DC077ED0>: Failed to resolve 'infinitybits.io' ([Errno 11001] getaddrinfo failed)"))
+2026-03-18 23:35:44  INFO      🆕  New URL tracked: https://careers.google.com/
+2026-03-18 23:35:46  INFO      🆕  New URL tracked: https://www.amazon.jobs/
+2026-03-18 23:35:48  INFO      🆕  New URL tracked: https://careers.microsoft.com/
+2026-03-18 23:35:48  ERROR     Request error for https://www.metacareers.com/ — 400 Client Error: Bad Request for url: https://www.metacareers.com/
+2026-03-18 23:35:50  INFO      🆕  New URL tracked: https://careers.digitalocean.com/
+2026-03-18 23:35:51  INFO      🆕  New URL tracked: https://stripe.com/jobs
+2026-03-18 23:35:53  INFO      🆕  New URL tracked: https://www.turing.com/jobs/remote-jobs-in-pakistan
+2026-03-18 23:35:53  INFO      State saved to E:\Github\Job-automate\state.json
+2026-03-18 23:35:53  INFO      Loaded 14 unique job titles from E:\Github\Job-automate\jobs.txt
+2026-03-18 23:35:53  INFO      Loaded 12 filter keywords from E:\Github\Job-automate\filters.txt
+2026-03-18 23:35:53  INFO      🔍  Searching: Associate Software Engineer in Pakistan
+2026-03-18 23:35:53  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:35:54  INFO      🔍  Searching: Associate Software Engineer in Lahore
+2026-03-18 23:35:54  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:35:55  INFO      🔍  Searching: Associate Software Engineer in Remote
+2026-03-18 23:35:55  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:35:56  INFO      🔍  Searching: Software Engineer in Pakistan
+2026-03-18 23:35:56  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:35:57  INFO      🔍  Searching: Software Engineer in Lahore
+2026-03-18 23:35:57  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:35:58  INFO      🔍  Searching: Software Engineer in Remote
+2026-03-18 23:35:58  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:35:59  INFO      🔍  Searching: Junior Software Engineer in Pakistan
+2026-03-18 23:35:59  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:00  INFO      🔍  Searching: Junior Software Engineer in Lahore
+2026-03-18 23:36:00  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:01  INFO      🔍  Searching: Junior Software Engineer in Remote
+2026-03-18 23:36:01  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:02  INFO      🔍  Searching: Graduate Software Engineer in Pakistan
+2026-03-18 23:36:02  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:03  INFO      🔍  Searching: Graduate Software Engineer in Lahore
+2026-03-18 23:36:03  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:04  INFO      🔍  Searching: Graduate Software Engineer in Remote
+2026-03-18 23:36:04  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:05  INFO      🔍  Searching: AIML Engineer in Pakistan
+2026-03-18 23:36:05  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:06  INFO      🔍  Searching: AIML Engineer in Lahore
+2026-03-18 23:36:06  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:07  INFO      🔍  Searching: AIML Engineer in Remote
+2026-03-18 23:36:07  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:08  INFO      🔍  Searching: AI Engineer in Pakistan
+2026-03-18 23:36:08  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:09  INFO      🔍  Searching: AI Engineer in Lahore
+2026-03-18 23:36:09  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:10  INFO      🔍  Searching: AI Engineer in Remote
+2026-03-18 23:36:10  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:11  INFO      🔍  Searching: Machine Learning Engineer in Pakistan
+2026-03-18 23:36:11  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:12  INFO      🔍  Searching: Machine Learning Engineer in Lahore
+2026-03-18 23:36:12  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:13  INFO      🔍  Searching: Machine Learning Engineer in Remote
+2026-03-18 23:36:13  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:14  INFO      🔍  Searching: Data Science Engineer in Pakistan
+2026-03-18 23:36:14  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:15  INFO      🔍  Searching: Data Science Engineer in Lahore
+2026-03-18 23:36:15  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:16  INFO      🔍  Searching: Data Science Engineer in Remote
+2026-03-18 23:36:16  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:17  INFO      🔍  Searching: Junior Data Scientist in Pakistan
+2026-03-18 23:36:17  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:18  INFO      🔍  Searching: Junior Data Scientist in Lahore
+2026-03-18 23:36:18  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:19  INFO      🔍  Searching: Junior Data Scientist in Remote
+2026-03-18 23:36:19  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:20  INFO      🔍  Searching: Data Scientist in Pakistan
+2026-03-18 23:36:20  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:21  INFO      🔍  Searching: Data Scientist in Lahore
+2026-03-18 23:36:21  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:22  INFO      🔍  Searching: Data Scientist in Remote
+2026-03-18 23:36:22  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:23  INFO      🔍  Searching: Python Developer in Pakistan
+2026-03-18 23:36:23  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:24  INFO      🔍  Searching: Python Developer in Lahore
+2026-03-18 23:36:24  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:25  INFO      🔍  Searching: Python Developer in Remote
+2026-03-18 23:36:25  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:26  INFO      🔍  Searching: Backend Developer in Pakistan
+2026-03-18 23:36:26  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:27  INFO      🔍  Searching: Backend Developer in Lahore
+2026-03-18 23:36:27  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:28  INFO      🔍  Searching: Backend Developer in Remote
+2026-03-18 23:36:28  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:29  INFO      🔍  Searching: Frontend Developer in Pakistan
+2026-03-18 23:36:29  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:30  INFO      🔍  Searching: Frontend Developer in Lahore
+2026-03-18 23:36:30  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:31  INFO      🔍  Searching: Frontend Developer in Remote
+2026-03-18 23:36:31  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:32  INFO      🔍  Searching: Full Stack Developer in Pakistan
+2026-03-18 23:36:32  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:33  INFO      🔍  Searching: Full Stack Developer in Lahore
+2026-03-18 23:36:33  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:34  INFO      🔍  Searching: Full Stack Developer in Remote
+2026-03-18 23:36:34  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:36:35  INFO      State saved to E:\Github\Job-automate\state.json
+2026-03-18 23:36:35  INFO      Nothing to report — no URL changes and no new job matches.
+2026-03-18 23:36:35  INFO      Job Monitor finished.
+2026-03-18 23:37:04  INFO      ============================================================
+2026-03-18 23:37:04  INFO        Job Monitor starting (DRY RUN)
+2026-03-18 23:37:04  INFO      ============================================================
+2026-03-18 23:37:04  INFO      API usage this month: 42 calls
+2026-03-18 23:37:04  INFO      Loaded Google credentials from credentials.json file.
+2026-03-18 23:37:04  INFO      Loaded 39 URLs from E:\Github\Job-automate\links.txt
+2026-03-18 23:37:05  INFO      ✅  No change:       https://www.systemsltd.com/careers/
+2026-03-18 23:37:07  INFO      🔄  Change detected: https://arbisoft.com/careers
+2026-03-18 23:37:08  INFO      ✅  No change:       https://arbisoft.hirestream.io/careers/
+2026-03-18 23:37:11  INFO      ✅  No change:       https://devsinc.com/careers
+2026-03-18 23:37:13  INFO      🔄  Change detected: https://www.10pearls.com/careers
+2026-03-18 23:37:17  INFO      🔄  Change detected: https://www.netsoltech.com/careers
+2026-03-18 23:37:20  INFO      ✅  No change:       https://www.contour-software.com/careers
+2026-03-18 23:37:21  INFO      🔄  Change detected: https://www.confiz.com/careers
+2026-03-18 23:37:23  INFO      🔄  Change detected: https://careers.tkxel.com/
+2026-03-18 23:37:26  INFO      ✅  No change:       https://www.techlogix.com/careers
+2026-03-18 23:37:28  INFO      ✅  No change:       https://www.folio3.com/careers
+2026-03-18 23:37:32  INFO      🔄  Change detected: https://www.nextbridge.com/careers
+2026-03-18 23:37:33  INFO      🔄  Change detected: https://strategic-systems-international.breezy.hr/
+2026-03-18 23:37:36  INFO      ✅  No change:       https://www.invozone.com/careers/
+2026-03-18 23:37:39  INFO      🔄  Change detected: https://www.purelogics.net/careers/
+2026-03-18 23:37:40  INFO      ✅  No change:       https://gomotive.com/careers/
+2026-03-18 23:37:42  INFO      ✅  No change:       https://dubizzle.applytojob.com/apply
+2026-03-18 23:37:44  INFO      ✅  No change:       https://tajir.app/careers
+2026-03-18 23:37:46  INFO      🔄  Change detected: https://jobs.careem.com/
+2026-03-18 23:37:48  INFO      ✅  No change:       https://www.afiniti.com/careers
+2026-03-18 23:37:51  INFO      🔄  Change detected: https://retailo.net/careers/
+2026-03-18 23:37:52  INFO      🔄  Change detected: https://www.sastaticket.pk/pages/career
+2026-03-18 23:37:53  INFO      ✅  No change:       https://www.bazaartech.com/careers/
+2026-03-18 23:37:54  INFO      🔄  Change detected: https://careers.daraz.com/
+2026-03-18 23:37:57  INFO      🔄  Change detected: https://www.aitomation.com/careers/
+2026-03-18 23:38:01  ERROR     Request error for https://www.venturedive.com/careers/ — ("Connection broken: ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None)", ConnectionResetError(10054, 'An existing connection was forcibly closed by the remote host', None, 10054, None))
+2026-03-18 23:38:04  INFO      🔄  Change detected: https://www.cubix.co/careers
+2026-03-18 23:38:05  INFO      ✅  No change:       https://www.nisum.com/careers
+2026-03-18 23:38:06  INFO      ✅  No change:       https://www.sadapay.pk/careers/
+2026-03-18 23:38:07  INFO      🔄  Change detected: https://www.nayapay.com/careers
+2026-03-18 23:38:18  ERROR     Request error for https://www.arfasoftech.com/careers — HTTPSConnectionPool(host='www.arfasoftech.com', port=443): Max retries exceeded with url: /careers (Caused by NameResolutionError("HTTPSConnection(host='www.arfasoftech.com', port=443): Failed to resolve 'www.arfasoftech.com' ([Errno 11001] getaddrinfo failed)"))
+2026-03-18 23:38:29  ERROR     Request error for https://infinitybits.io/careers — HTTPSConnectionPool(host='infinitybits.io', port=443): Max retries exceeded with url: /careers (Caused by NameResolutionError("HTTPSConnection(host='infinitybits.io', port=443): Failed to resolve 'infinitybits.io' ([Errno 11001] getaddrinfo failed)"))
+2026-03-18 23:38:33  INFO      🔄  Change detected: https://careers.google.com/
+2026-03-18 23:38:35  INFO      🔄  Change detected: https://www.amazon.jobs/
+2026-03-18 23:38:37  INFO      ✅  No change:       https://careers.microsoft.com/
+2026-03-18 23:38:37  ERROR     Request error for https://www.metacareers.com/ — 400 Client Error: Bad Request for url: https://www.metacareers.com/
+2026-03-18 23:38:39  INFO      ✅  No change:       https://careers.digitalocean.com/
+2026-03-18 23:38:40  INFO      🔄  Change detected: https://stripe.com/jobs
+2026-03-18 23:38:42  INFO      🔄  Change detected: https://www.turing.com/jobs/remote-jobs-in-pakistan
+2026-03-18 23:38:42  INFO      State saved to E:\Github\Job-automate\state.json
+2026-03-18 23:38:42  INFO      Loaded 14 unique job titles from E:\Github\Job-automate\jobs.txt
+2026-03-18 23:38:42  INFO      Loaded 12 filter keywords from E:\Github\Job-automate\filters.txt
+2026-03-18 23:38:42  INFO      🔍  Searching: Associate Software Engineer in Pakistan
+2026-03-18 23:38:42  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:43  INFO      🔍  Searching: Associate Software Engineer in Lahore
+2026-03-18 23:38:43  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:44  INFO      🔍  Searching: Associate Software Engineer in Remote
+2026-03-18 23:38:44  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:45  INFO      🔍  Searching: Software Engineer in Pakistan
+2026-03-18 23:38:45  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:46  INFO      🔍  Searching: Software Engineer in Lahore
+2026-03-18 23:38:46  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:47  INFO      🔍  Searching: Software Engineer in Remote
+2026-03-18 23:38:47  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:48  INFO      🔍  Searching: Junior Software Engineer in Pakistan
+2026-03-18 23:38:48  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:49  INFO      🔍  Searching: Junior Software Engineer in Lahore
+2026-03-18 23:38:49  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:50  INFO      🔍  Searching: Junior Software Engineer in Remote
+2026-03-18 23:38:50  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:51  INFO      🔍  Searching: Graduate Software Engineer in Pakistan
+2026-03-18 23:38:51  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:52  INFO      🔍  Searching: Graduate Software Engineer in Lahore
+2026-03-18 23:38:52  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:53  INFO      🔍  Searching: Graduate Software Engineer in Remote
+2026-03-18 23:38:53  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:54  INFO      🔍  Searching: AIML Engineer in Pakistan
+2026-03-18 23:38:54  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:55  INFO      🔍  Searching: AIML Engineer in Lahore
+2026-03-18 23:38:55  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:56  INFO      🔍  Searching: AIML Engineer in Remote
+2026-03-18 23:38:56  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:57  INFO      🔍  Searching: AI Engineer in Pakistan
+2026-03-18 23:38:57  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:58  INFO      🔍  Searching: AI Engineer in Lahore
+2026-03-18 23:38:58  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:38:59  INFO      🔍  Searching: AI Engineer in Remote
+2026-03-18 23:38:59  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:00  INFO      🔍  Searching: Machine Learning Engineer in Pakistan
+2026-03-18 23:39:00  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:01  INFO      🔍  Searching: Machine Learning Engineer in Lahore
+2026-03-18 23:39:01  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:02  INFO      🔍  Searching: Machine Learning Engineer in Remote
+2026-03-18 23:39:02  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:03  INFO      🔍  Searching: Data Science Engineer in Pakistan
+2026-03-18 23:39:03  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:04  INFO      🔍  Searching: Data Science Engineer in Lahore
+2026-03-18 23:39:04  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:05  INFO      🔍  Searching: Data Science Engineer in Remote
+2026-03-18 23:39:05  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:06  INFO      🔍  Searching: Junior Data Scientist in Pakistan
+2026-03-18 23:39:06  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:07  INFO      🔍  Searching: Junior Data Scientist in Lahore
+2026-03-18 23:39:07  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:08  INFO      🔍  Searching: Junior Data Scientist in Remote
+2026-03-18 23:39:08  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:09  INFO      🔍  Searching: Data Scientist in Pakistan
+2026-03-18 23:39:09  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:10  INFO      🔍  Searching: Data Scientist in Lahore
+2026-03-18 23:39:10  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:11  INFO      🔍  Searching: Data Scientist in Remote
+2026-03-18 23:39:11  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:12  INFO      🔍  Searching: Python Developer in Pakistan
+2026-03-18 23:39:12  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:13  INFO      🔍  Searching: Python Developer in Lahore
+2026-03-18 23:39:13  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:14  INFO      🔍  Searching: Python Developer in Remote
+2026-03-18 23:39:14  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:15  INFO      🔍  Searching: Backend Developer in Pakistan
+2026-03-18 23:39:15  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:16  INFO      🔍  Searching: Backend Developer in Lahore
+2026-03-18 23:39:16  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:17  INFO      🔍  Searching: Backend Developer in Remote
+2026-03-18 23:39:17  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:18  INFO      🔍  Searching: Frontend Developer in Pakistan
+2026-03-18 23:39:18  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:19  INFO      🔍  Searching: Frontend Developer in Lahore
+2026-03-18 23:39:19  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:20  INFO      🔍  Searching: Frontend Developer in Remote
+2026-03-18 23:39:20  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:21  INFO      🔍  Searching: Full Stack Developer in Pakistan
+2026-03-18 23:39:21  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:22  INFO      🔍  Searching: Full Stack Developer in Lahore
+2026-03-18 23:39:22  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:23  INFO      🔍  Searching: Full Stack Developer in Remote
+2026-03-18 23:39:23  WARNING   JSEARCH_API_KEY not set — skipping API search.
+2026-03-18 23:39:24  INFO      State saved to E:\Github\Job-automate\state.json
+2026-03-18 23:39:24  INFO      DRY RUN: would notify 19 URL changes + 0 new jobs.
+2026-03-18 23:39:24  INFO      Job Monitor finished.
+2026-03-19 00:52:55  INFO      ============================================================
+2026-03-19 00:52:55  INFO        Job Monitor starting (DRY RUN)
+2026-03-19 00:52:55  INFO      ============================================================
+2026-03-19 00:52:55  INFO      API usage this month: 84 calls
+2026-03-19 00:52:55  INFO      Loaded Google credentials from credentials.json file.
+2026-03-19 00:52:55  INFO      Health check: {'telegram': 'not configured', 'sheet': 'not configured', 'email': 'not configured'}
+2026-03-19 00:52:55  INFO      Health telegram: not configured
+2026-03-19 00:52:55  INFO      Health sheet: not configured
+2026-03-19 00:52:55  INFO      Health email: not configured
+2026-03-19 01:12:31  INFO      ============================================================
+2026-03-19 01:12:31  INFO        Job Monitor starting (DRY RUN)
+2026-03-19 01:12:31  INFO      ============================================================
+2026-03-19 01:12:31  INFO      API usage this month: 84 calls
+2026-03-19 01:12:31  INFO      GROQ disabled (missing key or package). Using fallback heuristics.
+2026-03-19 01:12:31  INFO      Health check: {'telegram': 'not configured', 'sheet': 'not configured', 'email': 'not configured'}
+2026-03-19 01:12:31  INFO      Health telegram: not configured
+2026-03-19 01:12:31  INFO      Health sheet: not configured
+2026-03-19 01:12:31  INFO      Health email: not configured
+2026-03-19 01:13:40  INFO      ============================================================
+2026-03-19 01:13:40  INFO        Job Monitor starting
+2026-03-19 01:13:40  INFO      ============================================================
+2026-03-19 01:13:40  INFO      API usage this month: 84 calls
+2026-03-19 01:13:40  INFO      GROQ disabled (missing key or package). Using fallback heuristics.
+2026-03-19 01:13:40  WARNING   Email notifier: one or more SMTP credentials missing. Emails will be skipped until credentials are set.
+2026-03-19 01:13:40  INFO      Test mode completed. Passed: none
+2026-03-19 01:13:40  WARNING   Test mode failures: telegram, email, sheet
+2026-03-19 01:20:18  INFO      ============================================================
+2026-03-19 01:20:18  INFO        Job Monitor starting
+2026-03-19 01:20:18  INFO      ============================================================
+2026-03-19 01:20:18  INFO      API usage this month: 84 calls
+2026-03-19 01:20:18  INFO      GROQ disabled (missing key or package). Using fallback heuristics.
+2026-03-19 01:20:18  WARNING   Email notifier: one or more SMTP credentials missing. Emails will be skipped until credentials are set.
+2026-03-19 01:20:18  INFO      Test mode completed. Passed: none
+2026-03-19 01:20:18  WARNING   Test mode failures: telegram, email, sheet
+2026-03-19 01:25:07  INFO      ============================================================
+2026-03-19 01:25:07  INFO        Job Monitor starting
+2026-03-19 01:25:07  INFO      ============================================================
+2026-03-19 01:25:07  INFO      API usage this month: 84 calls
+2026-03-19 01:25:07  INFO      GROQ AI client initialized with model 'llama-3.1-8b-instant'.
+2026-03-19 01:25:09  INFO      Loaded Google credentials from credentials.json file.
+2026-03-19 01:25:12  INFO      GoogleSheetsClient ready — sheet 'Job Alerts Tracker' (1ggNSYjT8jp1dKaABUd3DeTIEchITpiUEaf5I9kY2xFY), worksheet 'Sheet1'
+2026-03-19 01:25:15  INFO      GoogleSheetsClient ready — sheet 'Job Alerts Tracker' (1ggNSYjT8jp1dKaABUd3DeTIEchITpiUEaf5I9kY2xFY), worksheet 'Sheet1'
+2026-03-19 01:25:15  WARNING   Telegram API returned 400: {"ok":false,"error_code":400,"description":"Bad Request: chat not found"}
+2026-03-19 01:25:29  INFO      ✅ Email sent: '🧪 Job Monitor Email Test' → lrncourse123@gmail.com
+2026-03-19 01:25:31  INFO      Appended row for 'Test Notification Row' at 'Job Monitor Bot'
+2026-03-19 01:25:31  INFO      Test mode completed. Passed: email, sheet
+2026-03-19 01:25:31  WARNING   Test mode failures: telegram
+2026-03-19 01:26:58  INFO      ============================================================
+2026-03-19 01:26:58  INFO        Job Monitor starting (DRY RUN)
+2026-03-19 01:26:58  INFO      ============================================================
+2026-03-19 01:26:58  INFO      API usage this month: 84 calls
+2026-03-19 01:26:58  INFO      GROQ AI client initialized with model 'llama-3.1-8b-instant'.
+2026-03-19 01:27:00  INFO      Loaded Google credentials from credentials.json file.
+2026-03-19 01:27:04  INFO      GoogleSheetsClient ready — sheet 'Job Alerts Tracker' (1ggNSYjT8jp1dKaABUd3DeTIEchITpiUEaf5I9kY2xFY), worksheet 'Sheet1'
+2026-03-19 01:27:05  INFO      Loaded 39 URLs from E:\Github\Job-automate\links.txt
+2026-03-19 01:27:09  INFO      🔄  Change detected: https://www.systemsltd.com/careers/
+2026-03-19 01:27:12  INFO      🔄  Change detected: https://arbisoft.com/careers
+2026-03-19 01:27:14  INFO      ✅  No change:       https://arbisoft.hirestream.io/careers/
+2026-03-19 01:27:17  INFO      ✅  No change:       https://devsinc.com/careers
+2026-03-19 01:27:21  INFO      🔄  Change detected: https://www.10pearls.com/careers
+2026-03-19 01:27:28  INFO      🔄  Change detected: https://www.netsoltech.com/careers
+2026-03-19 01:27:31  INFO      ✅  No change:       https://www.contour-software.com/careers
+2026-03-19 01:27:35  INFO      🔄  Change detected: https://www.confiz.com/careers
+2026-03-19 01:27:50  ERROR     Request error for https://careers.tkxel.com/ — HTTPSConnectionPool(host='careers.tkxel.com', port=443): Max retries exceeded with url: / (Caused by ConnectTimeoutError(<HTTPSConnection(host='careers.tkxel.com', port=443) at 0x1e3576b8050>, 'Connection to careers.tkxel.com timed out. (connect timeout=15)'))
+2026-03-19 01:27:51  ERROR     Request error for https://www.techlogix.com/careers — 403 Client Error: Forbidden for url: https://www.techlogix.com/careers
+2026-03-19 01:27:56  INFO      🔄  Change detected: https://www.folio3.com/careers
+2026-03-19 01:28:02  INFO      🔄  Change detected: https://www.nextbridge.com/careers
+2026-03-19 01:28:04  INFO      🔄  Change detected: https://strategic-systems-international.breezy.hr/
+2026-03-19 01:28:09  INFO      ✅  No change:       https://www.invozone.com/careers/
+2026-03-19 01:28:12  ERROR     Request error for https://www.purelogics.net/careers/ — 429 Client Error: Too Many Requests for url: https://www.purelogics.net/careers/
+2026-03-19 01:28:15  INFO      🔄  Change detected: https://gomotive.com/careers/
+2026-03-19 01:28:19  INFO      ✅  No change:       https://dubizzle.applytojob.com/apply
+2026-03-19 01:28:21  INFO      ✅  No change:       https://tajir.app/careers
+2026-03-19 01:28:23  INFO      🔄  Change detected: https://jobs.careem.com/
+2026-03-19 01:28:26  ERROR     Request error for https://www.afiniti.com/careers — 403 Client Error: Forbidden for url: https://www.afiniti.com/careers
+2026-03-19 01:28:30  INFO      🔄  Change detected: https://retailo.net/careers/
+2026-03-19 01:28:31  INFO      🔄  Change detected: https://www.sastaticket.pk/pages/career
+2026-03-19 01:28:34  INFO      ✅  No change:       https://www.bazaartech.com/careers/
+2026-03-19 01:28:35  INFO      🔄  Change detected: https://careers.daraz.com/
+2026-03-19 01:28:37  INFO      🔄  Change detected: https://www.aitomation.com/careers/
+2026-03-19 01:28:42  INFO      🔄  Change detected: https://www.venturedive.com/careers/
+2026-03-19 01:28:45  INFO      🔄  Change detected: https://www.cubix.co/careers
+2026-03-19 01:28:46  INFO      ✅  No change:       https://www.nisum.com/careers
+2026-03-19 01:28:50  INFO      ✅  No change:       https://www.sadapay.pk/careers/
+2026-03-19 01:28:51  INFO      🔄  Change detected: https://www.nayapay.com/careers
+2026-03-19 01:28:52  ERROR     Request error for https://www.arfasoftech.com/careers — HTTPSConnectionPool(host='www.arfasoftech.com', port=443): Max retries exceeded with url: /careers (Caused by NameResolutionError("HTTPSConnection(host='www.arfasoftech.com', port=443): Failed to resolve 'www.arfasoftech.com' ([Errno 11001] getaddrinfo failed)"))
+2026-03-19 01:28:52  ERROR     Request error for https://infinitybits.io/careers — HTTPSConnectionPool(host='infinitybits.io', port=443): Max retries exceeded with url: /careers (Caused by NameResolutionError("HTTPSConnection(host='infinitybits.io', port=443): Failed to resolve 'infinitybits.io' ([Errno 11001] getaddrinfo failed)"))
+2026-03-19 01:28:56  INFO      🔄  Change detected: https://careers.google.com/
+2026-03-19 01:28:58  INFO      🔄  Change detected: https://www.amazon.jobs/
+2026-03-19 01:29:00  INFO      ✅  No change:       https://careers.microsoft.com/
+2026-03-19 01:29:01  ERROR     Request error for https://www.metacareers.com/ — 400 Client Error: Bad Request for url: https://www.metacareers.com/
+2026-03-19 01:29:04  INFO      🔄  Change detected: https://careers.digitalocean.com/
+2026-03-19 01:29:07  INFO      🔄  Change detected: https://stripe.com/jobs
+2026-03-19 01:29:08  INFO      🔄  Change detected: https://www.turing.com/jobs/remote-jobs-in-pakistan
+2026-03-19 01:29:08  INFO      State saved to E:\Github\Job-automate\state.json
+2026-03-19 01:29:08  INFO      Loaded 14 unique job titles from E:\Github\Job-automate\jobs.txt
+2026-03-19 01:29:08  INFO      Loaded 12 filter keywords from E:\Github\Job-automate\filters.txt
+2026-03-19 01:29:08  INFO      🔍  Searching: Associate Software Engineer in Pakistan
+2026-03-19 01:29:23  INFO         ❌ Excluded 'Associate Software Engineer - Python (Web)-786' — older than 7 days
+2026-03-19 01:29:23  INFO         ❌ Excluded 'Associate Software Engineer- OpenStack' — description contains 'senior'
+2026-03-19 01:29:24  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:26  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:26  INFO         ❌ Excluded 'Associate Software Engineer' — older than 7 days
+2026-03-19 01:29:26  INFO         ❌ Excluded 'Associate Software Engineer (ASE) - DevOps' — description contains 'senior'
+2026-03-19 01:29:26  INFO         ❌ Excluded 'Associate Software Engineer- Mobile Development' — older than 7 days
+2026-03-19 01:29:26  INFO         ❌ Excluded 'Associate Software Engineer (C++)' — older than 7 days
+2026-03-19 01:29:26  INFO         ❌ Excluded 'Associate Software Engineer' — description contains 'senior'
+2026-03-19 01:29:26  INFO         ❌ Excluded 'Associate Software Engineer- MERN (Islamabad)' — older than 7 days
+2026-03-19 01:29:26  INFO         ❌ Excluded 'Software Engineer — Internal Systems' — description contains '5+ years'
+2026-03-19 01:29:27  INFO      🔍  Searching: Associate Software Engineer in Lahore
+2026-03-19 01:29:35  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:36  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:36  INFO         ❌ Excluded 'Associate Software Engineer- OpenStack' — description contains 'senior'
+2026-03-19 01:29:38  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:39  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:40  INFO         ❌ Excluded 'Associate Software Engineer' — older than 7 days
+2026-03-19 01:29:40  INFO         ❌ Excluded 'Software Engineer — Internal Systems' — description contains '5+ years'
+2026-03-19 01:29:42  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:43  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:43  INFO         ❌ Excluded 'Associate Software Engineer (Web Scraping) - (FYP) in Data Science.' — older than 7 days
+2026-03-19 01:29:45  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:47  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:29:47  INFO         ❌ Excluded 'Associate Systems Engineer - Windows/Linux/Database/Virtualization' — description contains 'senior'
+2026-03-19 01:29:47  INFO         ❌ Excluded 'Associate Software Engineer: AI-Driven Backend & Python' — older than 7 days
+2026-03-19 01:29:48  INFO      🔍  Searching: Associate Software Engineer in Remote
+2026-03-19 01:30:00  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:02  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:03  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:05  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:05  INFO         ❌ Excluded 'Senior Associate, Software Engineering: Java' — title contains 'senior'
+2026-03-19 01:30:07  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:08  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 429 Too Many Requests"
+2026-03-19 01:30:08  INFO      Retrying request to /openai/v1/chat/completions in 4.000000 seconds
+2026-03-19 01:30:13  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:13  INFO         ❌ Excluded 'Associate Software Engineer (Java / Spring Boot) - Remote' — description contains 'senior'
+2026-03-19 01:30:14  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 429 Too Many Requests"
+2026-03-19 01:30:14  INFO      Retrying request to /openai/v1/chat/completions in 8.000000 seconds
+2026-03-19 01:30:23  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:23  INFO         ❌ Excluded 'DevSecOps Software Engineer (Associate or Experienced) Virtual' — AI classified as non-entry-level (The job requires 3+ years of experience in modern programming languages and DevOps/DevSecOps, indicating a mid-level position.)
+2026-03-19 01:30:23  INFO         ❌ Excluded 'Associate Software Engineer (Full-Stack) - Client Enablement' — older than 7 days
+2026-03-19 01:30:23  INFO         ❌ Excluded 'Associate Software Engineer - Java' — description contains 'lead'
+2026-03-19 01:30:23  INFO         ❌ Excluded 'Senior Associate, Support Engineer - Capital One Software (Remote)' — title contains 'senior'
+2026-03-19 01:30:23  INFO         ❌ Excluded 'Associate Software Engineer - hybrid (.NET or Java or Python)' — description contains 'senior'
+2026-03-19 01:30:24  INFO      🔍  Searching: Software Engineer in Pakistan
+2026-03-19 01:30:37  INFO         ❌ Excluded 'Software Engineer Level II' — description contains 'senior'
+2026-03-19 01:30:37  INFO         ❌ Excluded 'Software Engineer.' — description contains 'lead'
+2026-03-19 01:30:37  INFO         ❌ Excluded 'Senior Software Engineer I - Fullstack' — title contains 'senior'
+2026-03-19 01:30:37  INFO         ❌ Excluded 'Senior Software Engineer - II (Backend)' — title contains 'senior'
+2026-03-19 01:30:37  INFO         ❌ Excluded 'Lead II Software Engineer' — title contains 'lead'
+2026-03-19 01:30:37  INFO         ❌ Excluded 'Software Engineer (2-3 Years Experience)' — description contains 'lead'
+2026-03-19 01:30:38  INFO      HTTP Request: POST https://api.groq.com/openai/v1/chat/completions "HTTP/1.1 200 OK"
+2026-03-19 01:30:38  INFO         ❌ Excluded 'Software Engineer (Blockchain + React JS)' — AI classified as non-entry-level (The job requires a deep understanding of ReactJS, state management, and blockchain technologies, as well as experience with Git flows, NFTs, and Web3.js. The responsibilities also mention expertise in various tools and technologies, suggesting a senior-level position.)
+2026-03-19 01:30:38  INFO         ❌ Excluded 'Sr. Software Engineer (JAVA)' — description contains 'senior'
+2026-03-19 01:30:38  INFO         ❌ Excluded 'Software Engineer (Full-Time)' — description contains '5 years'
+2026-03-19 01:30:38  INFO         ❌ Excluded 'Associate Software Engineer - Python (Web)-786' — older than 7 days
+2026-03-19 01:30:39  INFO      🔍  Searching: Software Engineer in Lahore
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Software Engineer — Internal Systems' — description contains '5+ years'
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Team Lead - Senior Software Engineer' — title contains 'senior'
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Senior Software Engineer I - Backend' — title contains 'senior'
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Software Engineer (Full Stack) - Golang + TypeScript' — description contains '5+ years'
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Embedded Software Engineer' — older than 7 days
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Software Engineer III Lahore, Punjab, Pakistan' — description contains '6 years'
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Software Engineer Level II' — description contains 'senior'
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Software Engineer (React + Node)' — description contains 'lead'
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Associate Software Engineer' — older than 7 days
+2026-03-19 01:30:49  INFO         ❌ Excluded 'Senior Software Engineer (Ruby/Scala + TypeScript/JavaScript)' — title contains 'senior'
