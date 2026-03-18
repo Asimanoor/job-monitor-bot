@@ -1,0 +1,13 @@
+{
+    "request_timeout": 15,
+    "fuzzy_match_threshold": 70,
+    "jsearch_base_url": "https://jsearch.p.rapidapi.com/search",
+    "search_locations": [
+        "Pakistan",
+        "Lahore",
+        "Remote"
+    ],
+    "job_max_age_days": 7,
+    "max_notified_ids": 5000,
+    "telegram_max_len": 4000
+}

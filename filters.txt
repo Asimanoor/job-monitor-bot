@@ -1,0 +1,18 @@
+# Experience Level (OR logic - match any)
+fresh
+junior
+entry level
+graduate
+0-1 years
+0-2 years
+no experience
+
+# Job Type (OR logic)
+full-time
+
+
+# Location hints
+lahore
+pakistan
+remote
+work from home

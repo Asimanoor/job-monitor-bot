@@ -1,191 +1,323 @@
 """
 Job Monitoring System
-Monitors career page URLs for changes by comparing SHA256 hashes.
-Sends Telegram notifications when changes are detected.
+─────────────────────
+Main orchestrator script connecting config, API, filtering, and notifications.
 """
 
+import argparse
 import hashlib
-import json
 import logging
 import os
 import sys
-
+import time
 import requests
+from dotenv import load_dotenv
 
-# ── Configuration ────────────────────────────────────────────────────────────
-LINKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "links.txt")
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
-REQUEST_TIMEOUT = 15  # seconds
+from config_loader import ConfigLoader
+from filter_engine import FilterEngine
+from groq_client import GroqClient
+from jsearch_client import JSearchClient
+from state_manager import StateManager
+from telegram_bot import TelegramBot
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+# ── Paths ────────────────────────────────────────────────────────────────────
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LINKS_FILE = os.path.join(SCRIPT_DIR, "links.txt")
+JOBS_FILE = os.path.join(SCRIPT_DIR, "jobs.txt")
+FILTERS_FILE = os.path.join(SCRIPT_DIR, "filters.txt")
+STATE_FILE = os.path.join(SCRIPT_DIR, "state.json")
+PAUSE_FILE = os.path.join(SCRIPT_DIR, "pause.txt")
+LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 
 # ── Logging ──────────────────────────────────────────────────────────────────
+os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(os.path.join(
+            LOG_DIR, "monitor.log"), encoding="utf-8"),
+    ],
 )
 log = logging.getLogger(__name__)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def load_urls(filepath: str) -> list[str]:
-    """Read URLs from a text file, one per line. Blank lines are skipped."""
-    if not os.path.isfile(filepath):
-        log.error("Links file not found: %s", filepath)
-        sys.exit(1)
+def monitor_urls(state_mgr: StateManager) -> list[str]:
+    """Check URLs from links.txt for content changes."""
+    urls = ConfigLoader.load_urls(LINKS_FILE)
+    if not urls:
+        log.warning("No valid URLs to monitor.")
+        return []
 
-    with open(filepath, "r", encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip()]
-    log.info("Loaded %d URLs from %s", len(urls), filepath)
-    return urls
+    changed_urls = []
+    errors = []
 
-
-def load_state(filepath: str) -> dict[str, str]:
-    """Load previously stored hashes from state.json. Returns {} on first run."""
-    if not os.path.isfile(filepath):
-        return {}
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError) as exc:
-        log.warning("Could not read state file (%s). Starting fresh.", exc)
-        return {}
-
-
-def save_state(filepath: str, state: dict[str, str]) -> None:
-    """Persist the current URL → hash mapping to state.json."""
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    log.info("State saved to %s", filepath)
-
-
-def fetch_hash(url: str) -> str | None:
-    """Fetch a URL and return the SHA-256 hex digest of its body, or None on error."""
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        return hashlib.sha256(resp.content).hexdigest()
-    except requests.RequestException as exc:
-        log.error("Failed to fetch %s — %s", url, exc)
-        return None
-
-
-# ── Telegram Notification ────────────────────────────────────────────────────
-def send_telegram_notification(changed_urls: list[str]) -> None:
-    """
-    Send a Telegram message listing the changed URLs.
-    Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from environment variables.
-    Silently logs and returns on any failure so the workflow never crashes.
-    """
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-
-    if not bot_token or not chat_id:
-        log.warning("Telegram credentials not set. Skipping notification.")
-        return
-
-    url_list = "\n".join(f"• {u}" for u in changed_urls)
-    message = (
-        "🚨 Job Page Update Detected!\n\n"
-        "The following pages have changed:\n"
-        f"{url_list}\n\n"
-        "Please check immediately."
-    )
-
-    api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "disable_web_page_preview": True,
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
-    try:
-        resp = requests.post(api_url, json=payload, timeout=10)
-        if resp.ok:
-            log.info("✅ Telegram notification sent successfully.")
-        else:
-            log.warning("Telegram API returned %s: %s", resp.status_code, resp.text)
-    except requests.RequestException as exc:
-        log.warning("Failed to send Telegram notification: %s", exc)
+    with requests.Session() as session:
+        for url in urls:
+            try:
+                resp = session.get(url, headers=headers,
+                                   timeout=15, allow_redirects=True)
+                resp.raise_for_status()
+                new_hash = hashlib.sha256(resp.content).hexdigest()
 
+                old_hash = state_mgr.get_url_hash(url)
+                if old_hash is None:
+                    log.info("🆕  New URL tracked: %s", url)
+                elif new_hash != old_hash:
+                    log.info("🔄  Change detected: %s", url)
+                    changed_urls.append(url)
+                else:
+                    log.info("✅  No change:       %s", url)
 
-# ── Main Logic ───────────────────────────────────────────────────────────────
-def monitor() -> list[str]:
-    """
-    Run one monitoring cycle:
-      1. Read URLs from links.txt
-      2. Fetch each page and compute its SHA-256 hash
-      3. Compare against the last-known hash in state.json
-      4. Report any changes and update state.json
+                state_mgr.set_url_hash(url, new_hash)
+            except requests.RequestException as exc:
+                log.error("Request error for %s — %s", url, exc)
+                errors.append(url)
 
-    Returns a list of URLs whose content has changed.
-    """
-    urls = load_urls(LINKS_FILE)
-    state = load_state(STATE_FILE)
-    changed_urls: list[str] = []
-    errors: list[str] = []
-
-    for url in urls:
-        new_hash = fetch_hash(url)
-
-        if new_hash is None:
-            errors.append(url)
-            continue  # keep old hash in state; skip comparison
-
-        old_hash = state.get(url)
-
-        if old_hash is None:
-            log.info("🆕  New URL tracked: %s", url)
-        elif new_hash != old_hash:
-            log.info("🔄  Change detected: %s", url)
-            changed_urls.append(url)
-        else:
-            log.info("✅  No change:       %s", url)
-
-        # Always update to the latest hash
-        state[url] = new_hash
-
-    # Persist updated state
-    save_state(STATE_FILE, state)
-
-    # ── Summary ──────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("  MONITORING SUMMARY")
-    print("=" * 60)
-    print(f"  Total URLs checked : {len(urls)}")
-    print(f"  Changed            : {len(changed_urls)}")
-    print(f"  Errors / Unreachable: {len(errors)}")
-    print("=" * 60)
-
-    if changed_urls:
-        print("\n  ⚡ Changed URLs:")
-        for u in changed_urls:
-            print(f"     • {u}")
-
-    if errors:
-        print("\n  ⚠️  Unreachable URLs:")
-        for u in errors:
-            print(f"     • {u}")
-
-    print()
-
-    # ── Telegram notification ────────────────────────────────────────────
-    if changed_urls:
-        send_telegram_notification(changed_urls)
-
+    print("  URL MONITORING SUMMARY")
+    print(f"  Total    : {len(urls)}")
+    print(f"  Changed  : {len(changed_urls)}")
+    print(f"  Errors   : {len(errors)}")
+    print("=" * 60 + "\n")
     return changed_urls
 
 
+def _decode_base64_creds() -> str:
+    """Read GOOGLE_CREDENTIALS_JSON from env. Try base64 decode if needed."""
+    import base64
+    creds_file = os.path.join(SCRIPT_DIR, "credentials.json")
+    if os.path.isfile(creds_file):
+        with open(creds_file, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if content.startswith("{"):
+            log.info("Loaded Google credentials from credentials.json file.")
+            return content
+
+    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("{"):
+        return raw
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        if decoded.startswith("{"):
+            log.info("Decoded base64 Google credentials from env var.")
+            return decoded
+    except Exception:
+        pass
+    return raw
+
+
+def _build_notification_manager(telegram_bot: TelegramBot, ai_client: GroqClient | None = None):
+    """Build NotificationManager from environment setup."""
+    from notification_manager import NotificationManager
+
+    sheets_client = None
+    creds_json = _decode_base64_creds()
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "").strip()
+    sa_email = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL", "").strip()
+
+    if creds_json and sheet_id:
+        try:
+            from google_sheets_client import GoogleSheetsClient
+            sheets_client = GoogleSheetsClient(creds_json, sheet_id, sa_email)
+        except Exception as exc:
+            log.warning("Google Sheets init failed (non-fatal): %s", exc)
+
+    email_notifier = None
+    if os.environ.get("EMAIL_SENDER") or os.environ.get("SMTP_SENDER_EMAIL"):
+        try:
+            from email_notifier import EmailNotifier
+            email_notifier = EmailNotifier()
+        except Exception as exc:
+            log.warning("Email notifier init failed (non-fatal): %s", exc)
+
+    sheet_link = f"https://docs.google.com/spreadsheets/d/{sheet_id}" if sheet_id else ""
+
+    return NotificationManager(
+        telegram_bot=telegram_bot,
+        sheets_client=sheets_client,
+        email_notifier=email_notifier,
+        sheet_link=sheet_link,
+        ai_client=ai_client,
+    )
+
+
+def main() -> None:
+    load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+
+    # 1. Parse arguments
+    parser = argparse.ArgumentParser(description="Job Monitor Orchestrator")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run without sending notifications.")
+    parser.add_argument("--test-mode", action="store_true",
+                        help="Run standalone notification channel tests and exit.")
+    parser.add_argument("--job-limit", type=int, default=0,
+                        help="Max jobs to process.")
+    parser.add_argument("--health-check-only",
+                        action="store_true", help="Only run health check.")
+    args = parser.parse_args()
+
+    log.info("=" * 60)
+    log.info("  Job Monitor starting%s", " (DRY RUN)" if args.dry_run else "")
+    log.info("=" * 60)
+
+    # 2. Check for pause
+    if os.path.isfile(PAUSE_FILE):
+        log.info("⏸️  pause.txt found — exiting gracefully (Paused by user).")
+        return
+
+    # 3. Load config and state
+    config = ConfigLoader()
+    state_mgr = StateManager(STATE_FILE, config.get("max_notified_ids"))
+
+    log.info("API usage this month: %d calls",
+             state_mgr.state.get("api_usage", {}).get("count", 0))
+
+    # 4. Build clients
+    telegram = TelegramBot()
+    groq_ai = GroqClient()
+    filter_engine = FilterEngine(
+        fuzzy_threshold=config.get("fuzzy_match_threshold"),
+        max_age_days=config.get("job_max_age_days"),
+        ai_client=groq_ai,
+        ai_confidence_threshold=config.get("ai_confidence_threshold", 70),
+    )
+    jsearch = JSearchClient(timeout=config.get("request_timeout"))
+
+    # Process telegram commands (e.g. /status, /pause) immediately
+    telegram.process_updates(state_mgr)
+
+    if os.path.isfile(PAUSE_FILE):
+        log.info("⏸️  pause.txt created by bot — exiting gracefully.")
+        return
+
+    notifier = None
+    try:
+        notifier = _build_notification_manager(telegram, ai_client=groq_ai)
+    except Exception as exc:
+        log.error("Failed to build NotificationManager: %s", exc)
+
+    # Re-process /status so that it can access `notifier.health_check()`
+    telegram.process_updates(state_mgr, notifier=notifier)
+
+    if args.test_mode:
+        try:
+            from test_notifications import run_all_tests
+
+            test_results = run_all_tests(notifier=notifier)
+            passed = [k for k, v in test_results.items() if v]
+            failed = [k for k, v in test_results.items() if not v]
+
+            log.info("Test mode completed. Passed: %s", ", ".join(passed) if passed else "none")
+            if failed:
+                log.warning("Test mode failures: %s", ", ".join(failed))
+        except Exception as exc:
+            log.error("Test mode failed to run notification checks: %s", exc)
+        return
+
+    if args.health_check_only:
+        if notifier:
+            health = notifier.health_check()
+            for ch, status in health.items():
+                log.info("Health %s: %s", ch, status)
+        return
+
+    # 5. Monitor URLs
+    try:
+        changed_urls = monitor_urls(state_mgr)
+        state_mgr.save_state()
+    except Exception as exc:
+        log.error("URL monitoring crashed: %s", exc)
+        changed_urls = []
+
+    # 6. Search jobs
+    titles = ConfigLoader.load_job_titles(JOBS_FILE)
+    filters = ConfigLoader.load_filters(FILTERS_FILE)
+    locations = config.get("search_locations")
+
+    if state_mgr.should_skip_due_to_rate_limit():
+        log.error(
+            "API Limit approaching 500/month. Skipping JSearch to avoid quota exhaustion.")
+        titles = []
+
+    all_qualified_jobs = []
+
+    # Add an inter-query delay as a defensive practice (Warning in Section B)
+    rate_limit_delay = 1
+
+    for title in titles:
+        for location in locations:
+            query = f"{title} in {location}"
+            log.info("🔍  Searching: %s", query)
+
+            state_mgr.track_api_usage()
+            raw_results = jsearch.search_jobs(title, location)
+
+            for raw in raw_results:
+                job = filter_engine.qualify_job(raw, titles, filters)
+                if job:
+                    all_qualified_jobs.append(job)
+
+            time.sleep(rate_limit_delay)
+
+    # Sort by relevance score
+    all_qualified_jobs.sort(key=lambda j: j.get("score", 0), reverse=True)
+
+    # Apply limit
+    if args.job_limit > 0:
+        all_qualified_jobs = all_qualified_jobs[:args.job_limit]
+
+    # Deduplicate against state.json to find truly NEW jobs
+    new_jobs = filter_engine.deduplicate_jobs(all_qualified_jobs, state_mgr)
+    state_mgr.save_state()
+
+    print("\n" + "=" * 60)
+    print("  JSEARCH JOB RESULTS")
+    print(f"  Qualified jobs     : {len(all_qualified_jobs)}")
+    print(f"  New (not notified) : {len(new_jobs)}")
+    print("=" * 60 + "\n")
+
+    # 7. Notify
+    if changed_urls or new_jobs:
+        if args.dry_run:
+            log.info("DRY RUN: would notify %d URL changes + %d new jobs.",
+                     len(changed_urls), len(new_jobs))
+        elif notifier is not None:
+            try:
+                if changed_urls:
+                    notifier.send_url_change_alert(changed_urls)
+                if new_jobs:
+                    notifier.notify_new_jobs(new_jobs)
+            except Exception as exc:
+                log.error("Notification pipeline crashed: %s", exc)
+    else:
+        log.info("Nothing to report — no URL changes and no new job matches.")
+
+    # 8. Commit State
+    if not args.dry_run:
+        state_mgr.commit_to_github()
+
+    log.info("Job Monitor finished.")
+
+
 if __name__ == "__main__":
-    changed = monitor()
-    # Always exit 0 so the GitHub Action workflow doesn't crash
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("Interrupted by user.")
+    except Exception as exc:
+        log.critical("Unhandled exception: %s", exc, exc_info=True)
     sys.exit(0)

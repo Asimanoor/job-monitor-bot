@@ -1,0 +1,23 @@
+# ── Secrets & Credentials ────────────────────────────────────
+credentials.json
+.env
+
+# ── Runtime artifacts ────────────────────────────────────────
+*.log
+logs/
+failed_alerts.json
+state.json.tmp
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# ── IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
