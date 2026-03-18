@@ -2,9 +2,12 @@ name: Job Page Monitor
 
 on:
   schedule:
-    # Run every 6 hours
-    - cron: "0 */6 * * *"
+    # Run every 12 hours to preserve JSearch monthly quota
+    - cron: "0 */12 * * *"
   workflow_dispatch: # Allow manual trigger from GitHub UI
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
   contents: write # Needed to push state.json back
@@ -16,13 +19,13 @@ jobs:
     steps:
       # ── 1. Checkout the repo ───────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ secrets.GH_PAT }}
 
       # ── 2. Setup Python ────────────────────────────────────────────────
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.10"
 
