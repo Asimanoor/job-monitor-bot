@@ -24,20 +24,40 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.10"
 
       # ── 3. Install dependencies ────────────────────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 4. Run the monitor script ──────────────────────────────────────
+      # ── 4. Decode base64 Google credentials (if set) ───────────────────
+      - name: Decode Google credentials
+        if: ${{ env.GOOGLE_CREDENTIALS_JSON != '' }}
+        run: echo "$GOOGLE_CREDENTIALS_JSON" | base64 -d > credentials.json
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+      # ── 5. Run the monitor script ──────────────────────────────────────
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          JSEARCH_API_KEY: ${{ secrets.JSEARCH_API_KEY }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python monitor.py
 
-      # ── 5. Commit & push updated state.json ────────────────────────────
+      # ── 6. Cleanup credentials ─────────────────────────────────────────
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f credentials.json
+
+      # ── 7. Commit & push updated state.json ────────────────────────────
       - name: Commit and push state.json
         run: |
           git config user.name "Job Monitor Bot"

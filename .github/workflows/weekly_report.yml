@@ -1,0 +1,64 @@
+name: Weekly Job Report
+
+on:
+  schedule:
+    # Sunday 4:00 AM UTC = 9:00 AM PKT
+    - cron: "0 4 * * 0"
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Decode Google credentials
+        if: ${{ env.GOOGLE_CREDENTIALS_JSON != '' }}
+        run: echo "$GOOGLE_CREDENTIALS_JSON" | base64 -d > credentials.json
+        env:
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+
+      - name: Run weekly report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_RECIPIENT: ${{ secrets.EMAIL_RECIPIENT }}
+        run: python weekly_report.py
+
+      - name: Cleanup credentials
+        if: always()
+        run: rm -f credentials.json
+
+      - name: Commit state.json if changed
+        run: |
+          git config user.name "Job Monitor Bot"
+          git config user.email "job-monitor-bot@github-actions.local"
+
+          if git diff --quiet state.json 2>/dev/null && \
+             ! git ls-files --others --exclude-standard | grep -q "state.json"; then
+            echo "No state changes."
+          else
+            git add state.json
+            git commit -m "chore: update state after weekly archive [skip ci]"
+            git push
+          fi
