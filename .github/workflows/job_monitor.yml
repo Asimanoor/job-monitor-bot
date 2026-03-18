@@ -1,0 +1,55 @@
+name: Job Page Monitor
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: "0 */6 * * *"
+  workflow_dispatch: # Allow manual trigger from GitHub UI
+
+permissions:
+  contents: write # Needed to push state.json back
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout the repo ───────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      # ── 2. Setup Python ────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # ── 3. Install dependencies ────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run the monitor script ──────────────────────────────────────
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      # ── 5. Commit & push updated state.json ────────────────────────────
+      - name: Commit and push state.json
+        run: |
+          git config user.name "Job Monitor Bot"
+          git config user.email "job-monitor-bot@github-actions.local"
+
+          # Only commit if state.json actually changed
+          if git diff --quiet state.json 2>/dev/null && \
+             ! git ls-files --others --exclude-standard | grep -q "state.json"; then
+            echo "state.json unchanged — nothing to commit."
+          else
+            git add state.json
+            git commit -m "chore: update state.json hashes [skip ci]"
+            git push
+            echo "✅ state.json committed and pushed."
+          fi
