@@ -13,7 +13,6 @@ Machine Learning Engineer
 Data Science Engineer
 Junior Data Scientist
 Data Scientist
-ML Engineer
 Data Analyst
 # Other Tech Roles
 Python Developer
@@ -21,4 +20,3 @@ Junior Python Developer
 Associate Python Developer
 Backend Developer
 Frontend Developer
-Full Stack Developer
