@@ -1471,10 +1471,6 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         except Exception as exc:
             log.warning("Internet company search failed (non-fatal): %s", exc)
 
-    # 8. Commit State
-    if not args.dry_run:
-        state_mgr.commit_to_github()
-
     log.info("Job Monitor cycle #%d finished.", cycle_number)
 
 
