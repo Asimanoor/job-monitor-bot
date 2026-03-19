@@ -26,6 +26,11 @@ class ConfigLoader:
             "jsearch_monthly_limit": 200,
             "jsearch_safety_buffer": 10,
             "jsearch_max_queries_per_run": 3,
+            # Keep false by default to avoid noisy/off-domain jobs and to stay free-tier.
+            "enable_jsearch_api": False,
+            "jsearch_fail_fast_on_429": True,
+            "jsearch_rate_limit_cooldown_seconds": 900,
+            "jsearch_rate_limit_retries": 1,
             "company_targeted_search_enabled": True,
             "company_targeted_max_companies": 90,
             "company_targeted_max_queries_per_run": 4,
@@ -38,10 +43,22 @@ class ConfigLoader:
             "playwright_headless": True,
             "playwright_timeout_seconds": 30,
             "playwright_max_openings_per_page": 80,
-            "link_scraper_max_openings_per_site": 300,
+            "link_scraper_max_openings_per_site": 120,
             "link_scraper_max_pages": 8,
+            "url_change_alert_max_events": 20,
+            "url_change_max_events_per_cycle": 200,
+            "url_change_max_openings_per_event": 300,
+            "url_change_max_openings_per_cycle": 5000,
+            "url_change_log_baseline_openings": True,
+            # Job-only mission: do NOT write noisy URL-change-derived openings to Sheets
+            # unless explicitly enabled.
+            "record_url_changes_to_sheets": False,
             "url_monitor_async_concurrency": 4,
-            "jsearch_async_concurrency": 2,
+            "jsearch_async_concurrency": 1,
+            # How many matched jobs to enrich with full description per run
+            "job_details_max_per_cycle": 20,
+            # Minimum description length required to consider extraction valid
+            "job_description_min_chars": 120,
         }
 
     def _load_from_file(self) -> None:
@@ -99,6 +116,35 @@ class ConfigLoader:
         if "JSEARCH_MAX_QUERIES_PER_RUN" in os.environ:
             try:
                 self.config["jsearch_max_queries_per_run"] = int(os.environ["JSEARCH_MAX_QUERIES_PER_RUN"])
+            except ValueError:
+                pass
+        if "JSEARCH_FAIL_FAST_ON_429" in os.environ:
+            self.config["jsearch_fail_fast_on_429"] = os.environ["JSEARCH_FAIL_FAST_ON_429"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "JSEARCH_RATE_LIMIT_COOLDOWN_SECONDS" in os.environ:
+            try:
+                self.config["jsearch_rate_limit_cooldown_seconds"] = int(os.environ["JSEARCH_RATE_LIMIT_COOLDOWN_SECONDS"])
+            except ValueError:
+                pass
+        if "JSEARCH_RATE_LIMIT_RETRIES" in os.environ:
+            try:
+                self.config["jsearch_rate_limit_retries"] = int(os.environ["JSEARCH_RATE_LIMIT_RETRIES"])
+            except ValueError:
+                pass
+        if "ENABLE_JSEARCH_API" in os.environ:
+            self.config["enable_jsearch_api"] = os.environ["ENABLE_JSEARCH_API"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+
+        if "JOB_DETAILS_MAX_PER_CYCLE" in os.environ:
+            try:
+                self.config["job_details_max_per_cycle"] = int(os.environ["JOB_DETAILS_MAX_PER_CYCLE"])
+            except ValueError:
+                pass
+        if "JOB_DESCRIPTION_MIN_CHARS" in os.environ:
+            try:
+                self.config["job_description_min_chars"] = int(os.environ["JOB_DESCRIPTION_MIN_CHARS"])
             except ValueError:
                 pass
         if "COMPANY_TARGETED_SEARCH_ENABLED" in os.environ:
@@ -166,6 +212,34 @@ class ConfigLoader:
                 self.config["link_scraper_max_pages"] = int(os.environ["LINK_SCRAPER_MAX_PAGES"])
             except ValueError:
                 pass
+        if "URL_CHANGE_ALERT_MAX_EVENTS" in os.environ:
+            try:
+                self.config["url_change_alert_max_events"] = int(os.environ["URL_CHANGE_ALERT_MAX_EVENTS"])
+            except ValueError:
+                pass
+        if "URL_CHANGE_MAX_EVENTS_PER_CYCLE" in os.environ:
+            try:
+                self.config["url_change_max_events_per_cycle"] = int(os.environ["URL_CHANGE_MAX_EVENTS_PER_CYCLE"])
+            except ValueError:
+                pass
+        if "URL_CHANGE_MAX_OPENINGS_PER_EVENT" in os.environ:
+            try:
+                self.config["url_change_max_openings_per_event"] = int(os.environ["URL_CHANGE_MAX_OPENINGS_PER_EVENT"])
+            except ValueError:
+                pass
+        if "URL_CHANGE_MAX_OPENINGS_PER_CYCLE" in os.environ:
+            try:
+                self.config["url_change_max_openings_per_cycle"] = int(os.environ["URL_CHANGE_MAX_OPENINGS_PER_CYCLE"])
+            except ValueError:
+                pass
+        if "URL_CHANGE_LOG_BASELINE_OPENINGS" in os.environ:
+            self.config["url_change_log_baseline_openings"] = os.environ["URL_CHANGE_LOG_BASELINE_OPENINGS"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "RECORD_URL_CHANGES_TO_SHEETS" in os.environ:
+            self.config["record_url_changes_to_sheets"] = os.environ["RECORD_URL_CHANGES_TO_SHEETS"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
         if "URL_MONITOR_ASYNC_CONCURRENCY" in os.environ:
             try:
                 self.config["url_monitor_async_concurrency"] = int(os.environ["URL_MONITOR_ASYNC_CONCURRENCY"])

@@ -2,10 +2,9 @@
 Notification Manager
 ────────────────────
 Orchestrates all notification channels:
-  1. Telegram  (fastest, best-effort)
-  2. Google Sheets  (persistent record, always attempted)
-  3. Email  (emergency fallback if both Telegram AND Sheets fail)
-  4. failed_alerts.json  (last resort if ALL channels fail)
+  1. Google Sheets  (persistent record, always attempted)
+  2. Email  (fallback if Sheets fails)
+  3. failed_alerts.json  (last resort if ALL channels fail)
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from job_scraper import is_valid_job_posting
-from telegram_bot import TelegramBot
+from role_filter import matches_target_role
 
 log = logging.getLogger(__name__)
 
@@ -62,17 +61,25 @@ class NotificationManager:
 
     def __init__(
         self,
-        telegram_bot: TelegramBot | None = None,
         sheets_client: SheetsClient | None = None,
         email_notifier: Emailer | None = None,
         sheet_link: str = "",
         ai_client: Any | None = None,
+        url_change_alert_max_events: int = 20,
+        url_change_max_events_per_cycle: int = 200,
+        url_change_max_openings_per_event: int = 300,
+        url_change_max_openings_per_cycle: int = 5000,
+        url_change_log_baseline_openings: bool = True,
     ) -> None:
-        self._tg = telegram_bot
         self._sheets = sheets_client
         self._email = email_notifier
         self._sheet_link = sheet_link
         self._ai = ai_client
+        self._url_change_alert_max_events = max(1, int(url_change_alert_max_events))
+        self._url_change_max_events_per_cycle = max(1, int(url_change_max_events_per_cycle))
+        self._url_change_max_openings_per_event = max(1, int(url_change_max_openings_per_event))
+        self._url_change_max_openings_per_cycle = max(1, int(url_change_max_openings_per_cycle))
+        self._url_change_log_baseline_openings = bool(url_change_log_baseline_openings)
 
     def _enrich_jobs_with_ai(self, jobs: list[dict[str, Any]]) -> None:
         """Attach AI summary + cover-letter points, preserving graceful fallback behavior."""
@@ -176,6 +183,7 @@ class NotificationManager:
                         "domain": str(item.get("domain") or urlparse(url).netloc),
                         "change_type": str(item.get("change_type") or "content_changed"),
                         "page_title": str(item.get("page_title") or ""),
+                        "scraper_used": str(item.get("scraper_used") or "unknown"),
                         "openings": openings,
                         "new_openings": new_openings,
                         "total_openings": int(item.get("total_openings") or len(openings)),
@@ -221,12 +229,11 @@ class NotificationManager:
         """
         Send notifications for a batch of new jobs across all channels.
         Priority:
-          1. Telegram (inline buttons for Apply)
-          2. Google Sheets (persistent record)
-          3. Email (fallback if both Telegram + Sheets fail)
-          4. failed_alerts.json (last resort if ALL fail)
+          1. Google Sheets (persistent record)
+          2. Email (fallback if Sheets fails)
+          3. failed_alerts.json (last resort if ALL fail)
         """
-        result = {"telegram": False, "sheet": False, "email": False}
+        result = {"sheet": False, "email": False}
 
         if not jobs:
             log.info("No jobs to notify — skipping all channels.")
@@ -235,13 +242,7 @@ class NotificationManager:
         # Enrich only after jobs are confirmed as new and before channel dispatch.
         self._enrich_jobs_with_ai(jobs)
 
-        # ── 1. Telegram with inline buttons ──────────────────────────────
-        if self._tg:
-            result["telegram"] = self._tg.send_job_alert(jobs)
-        else:
-            log.info("Telegram not configured — skipping.")
-
-        # ── 2. Google Sheets ─────────────────────────────────────────────
+        # ── 1. Google Sheets ─────────────────────────────────────────────
         if self._sheets is not None:
             sheet_ok = 0
             for j in jobs:
@@ -255,9 +256,9 @@ class NotificationManager:
             log.info("Google Sheets not configured — skipping.")
 
         # ── 3. Email (fallback) ──────────────────────────────────────────
-        if not result["telegram"] and not result["sheet"]:
+        if not result["sheet"]:
             log.warning(
-                "Both Telegram and Sheets failed — attempting email fallback.")
+                "Google Sheets failed — attempting email fallback.")
             if self._email is not None and self._email.is_configured:
                 result["email"] = self._email.send_job_alert_email(
                     jobs, search_query, self._sheet_link
@@ -283,7 +284,7 @@ class NotificationManager:
         lines: list[str] = []
         sample_positions: list[str] = []
 
-        for event in events[:20]:
+        for event in events[: self._url_change_alert_max_events]:
             url = str(event.get("url", ""))
             change_type = str(event.get("change_type", "content_changed"))
             total = int(event.get("total_openings", 0) or 0)
@@ -300,23 +301,22 @@ class NotificationManager:
                     title = str(opening.get("title", "")).strip()
                     link = str(opening.get("link", "")).strip()
                     if title and link:
+                        job_payload = {
+                            "title": title,
+                            "apply_link": link,
+                            "job_url": link,
+                            "source_url": url,
+                        }
+                        if not is_valid_job_posting(job_payload):
+                            continue
+                        matched, _role, _score = matches_target_role(title, description="")
+                        if not matched:
+                            continue
                         sample_positions.append(f"• {title} — {link}")
 
-        opening_summary = ""
-        if sample_positions:
-            preview = "\n".join(sample_positions[:8])
-            opening_summary = f"\n\n<b>Sample newly detected openings:</b>\n{preview}"
-
-        url_list = "\n".join(lines)
-        text = (
-            "🚨 <b>Career Page Update Detected!</b>\n\n"
-            "The following pages have changed:\n"
-            f"{url_list}{opening_summary}\n\n"
-            "All changes and detected openings are being logged to Google Sheets."
-        )
-        if self._tg:
-            return self._tg.send_message(text)
-        return False
+        # URL changes are logged to Google Sheets only (no Telegram alerts)
+        # Proceed to record_url_changes_in_sheet()
+        return True
 
     def record_url_changes_in_sheet(self, changed_urls: list[Any]) -> bool:
         """Persist validated job openings extracted from monitored career URLs."""
@@ -324,8 +324,18 @@ class NotificationManager:
         if not events or self._sheets is None:
             return False
 
+        if len(events) > self._url_change_max_events_per_cycle:
+            log.warning(
+                "URL change events exceed cap (%d > %d). Truncating this cycle for quota safety.",
+                len(events),
+                self._url_change_max_events_per_cycle,
+            )
+            events = events[: self._url_change_max_events_per_cycle]
+
         change_payloads: list[dict[str, Any]] = []
         opening_payloads: list[dict[str, Any]] = []
+        global_seen_tokens: set[str] = set()
+        remaining_opening_budget = self._url_change_max_openings_per_cycle
 
         for event in events:
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -354,11 +364,21 @@ class NotificationManager:
                         for opening in new_openings[:5]
                         if isinstance(opening, dict)
                     ],
-                    "notes": f"Job-only monitor (source=links.txt, scraper={scraper_used})",
+                    "notes": f"Job-only monitor (source=links.txt, scraper={scraper_used}, cap={self._url_change_max_openings_per_event}/event)",
                 }
             )
 
-            openings_to_log = new_openings if new_openings else (all_openings if change_type == "new_url_tracked" else [])
+            openings_to_log = new_openings if new_openings else (
+                all_openings if (change_type == "new_url_tracked" and self._url_change_log_baseline_openings) else []
+            )
+            openings_to_log = openings_to_log[: self._url_change_max_openings_per_event]
+
+            if remaining_opening_budget <= 0:
+                openings_to_log = []
+            elif len(openings_to_log) > remaining_opening_budget:
+                openings_to_log = openings_to_log[:remaining_opening_budget]
+
+            remaining_opening_budget -= len(openings_to_log)
 
             seen_tokens: set[str] = set()
             for opening in openings_to_log:
@@ -381,10 +401,16 @@ class NotificationManager:
                 if not is_valid_job_posting(job_payload):
                     continue
 
+                # Apply role filtering — only log openings matching target roles
+                matched, _, _ = matches_target_role(opening_title)
+                if not matched:
+                    continue
+
                 token = f"{job_payload['title'].lower()}|{job_payload['apply_link'].lower()}"
-                if token in seen_tokens:
+                if token in seen_tokens or token in global_seen_tokens:
                     continue
                 seen_tokens.add(token)
+                global_seen_tokens.add(token)
 
                 opening_payloads.append(
                     {
@@ -425,10 +451,15 @@ class NotificationManager:
 
         if appended_openings == 0 and opening_payloads:
             append_opening_fn = getattr(self._sheets, "append_career_opening_row", None)
-            if callable(append_opening_fn):
+            if callable(append_opening_fn) and len(opening_payloads) <= 10:
                 for payload in opening_payloads:
                     if bool(append_opening_fn(payload)):
                         appended_openings += 1
+            elif callable(append_opening_fn):
+                log.warning(
+                    "Skipping single-row fallback for %d opening rows to avoid quota spikes.",
+                    len(opening_payloads),
+                )
 
         if appended_changes < len(change_payloads):
             log.warning("Sheets URL change logging partial success: %d/%d", appended_changes, len(change_payloads))

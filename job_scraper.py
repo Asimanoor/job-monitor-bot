@@ -178,6 +178,91 @@ JOB_TITLE_BAD_TOKENS = {
     "blog",
 }
 
+ROLE_TITLE_KEYWORDS = {
+    "engineer",
+    "developer",
+    "scientist",
+    "analyst",
+    "architect",
+    "manager",
+    "lead",
+    "officer",
+    "executive",
+    "specialist",
+    "administrator",
+    "consultant",
+    "recruiter",
+    "designer",
+    "technician",
+    "support",
+    "intern",
+    "internship",
+    "trainee",
+    "graduate",
+    "associate",
+    "principal",
+    "director",
+    "qa",
+    "sqa",
+    "devops",
+    "sre",
+}
+
+NON_ROLE_TITLE_PHRASES = {
+    "learn more",
+    "read more",
+    "view all",
+    "get more details",
+    "privacy",
+    "policy",
+    "terms",
+    "cookie",
+    "overview",
+    "guide",
+    "webinar",
+    "case study",
+    "solutions",
+    "services",
+    "platform overview",
+    "developer portal",
+    "disclaimer",
+    "summit",
+    "report",
+    "ebook",
+}
+
+# Service/marketing phrases that look like job titles but aren't
+SERVICE_MARKETING_PHRASES = {
+    "data modernization",
+    "data management",
+    "cloud-native engineering",
+    "cloud native",
+    "digital transformation",
+    "ai-first platform",
+    "agentic architecture",
+    "intelligent business",
+    "smart-manufacturing",
+    "smart manufacturing",
+    "customer engagement",
+    "enterprise modernization",
+    "generative ai",
+    "security",
+    "retail",
+    "cybersecurity",
+    "security policy",
+    "custom software development",
+    "mobile app development",
+    "web development",
+    "devops consulting",
+    "quality assurance services",
+    "staff augmentation",
+    "product design",
+    "dedicated teams",
+    "software testing",
+    "blockchain development",
+    "iot solutions",
+}
+
 DATE_PATTERNS = [
     re.compile(r"\b\d{4}-\d{2}-\d{2}\b"),
     re.compile(r"\b\d{2}/\d{2}/\d{4}\b"),
@@ -426,10 +511,40 @@ def _looks_like_valid_title(title: str) -> bool:
     return True
 
 
+def _looks_like_role_title(title: str) -> bool:
+    cleaned = _clean_text(title)
+    lower = cleaned.lower()
+
+    if not cleaned:
+        return False
+
+    if any(phrase in lower for phrase in NON_ROLE_TITLE_PHRASES):
+        return False
+
+    # Reject service/marketing titles
+    if any(phrase in lower for phrase in SERVICE_MARKETING_PHRASES):
+        return False
+
+    if re.match(r"^[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}\b", cleaned):
+        return False
+
+    if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b", cleaned):
+        return False
+
+    # Reject single-word titles (too vague to be a real job posting)
+    if len(cleaned.split()) == 1:
+        return False
+
+    return any(re.search(r"\b" + re.escape(keyword) + r"\b", lower) for keyword in ROLE_TITLE_KEYWORDS)
+
+
 
 def is_valid_job_posting(data: dict[str, Any]) -> bool:
     title = _clean_text(str(data.get("title") or ""))
     if not _looks_like_valid_title(title):
+        return False
+
+    if not _looks_like_role_title(title):
         return False
 
     apply_link = _clean_text(str(data.get("apply_link") or ""))
@@ -440,6 +555,14 @@ def is_valid_job_posting(data: dict[str, Any]) -> bool:
     link = (apply_link or job_url).lower()
     if not any(keyword in link for keyword in JOB_URL_KEYWORDS):
         return False
+
+    source_url = _clean_text(str(data.get("source_url") or ""))
+    if source_url:
+        try:
+            if _canonicalize_url(source_url).rstrip("/") == _canonicalize_url(link).rstrip("/"):
+                return False
+        except Exception:
+            pass
 
     if any(noise in link for noise in ["/blog", "/news", "/insights", "/services", "/privacy", "/terms"]):
         return False
@@ -499,7 +622,7 @@ def _candidate_containers(soup: BeautifulSoup) -> list[Tag]:
 
 
 
-def extract_job_postings(page_html: str, page_url: str, max_results: int = 200) -> list[dict[str, Any]]:
+def extract_job_postings(page_html: str, page_url: str, max_results: int = 50) -> list[dict[str, Any]]:
     """Extract ONLY real job postings from career page HTML."""
     soup = BeautifulSoup(page_html or "", "html.parser")
     page_title = _clean_text(soup.title.get_text(" ", strip=True)) if soup.title else ""

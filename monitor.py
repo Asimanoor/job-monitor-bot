@@ -23,9 +23,20 @@ from job_scraper import extract_job_postings, is_valid_job_posting
 from config_loader import ConfigLoader
 from filter_engine import FilterEngine
 from groq_client import GroqClient
-from jsearch_client import JSearchClient
+from jsearch_client import JSearchClient, JSearchRateLimitError
+from job_extractor import (
+    fetch_job_description_snippet,
+    job_dict_for_sheet,
+    normalize_apply_link,
+    stable_job_dedupe_key,
+)
+from role_filter import filter_jobs_by_role, matches_target_role
 from state_manager import StateManager
-from telegram_bot import TelegramBot
+
+try:
+    from internet_job_searcher import search_internet_for_companies
+except Exception:  # pragma: no cover - handled gracefully at runtime
+    search_internet_for_companies = None
 
 try:
     from mcp_scraper import MultiStrategyCareerScraper
@@ -649,6 +660,7 @@ async def _execute_jsearch_plan_async(
         return []
 
     sem = asyncio.Semaphore(max(1, int(concurrency)))
+    abort_event = asyncio.Event()
 
     async def _worker(task: dict[str, str]) -> dict[str, object]:
         query_text = str(task.get("query") or "").strip()
@@ -656,12 +668,66 @@ async def _execute_jsearch_plan_async(
         shown_query = f"{query_text} in {location_text}" if location_text else query_text
 
         if not query_text:
-            return {"task": task, "raw_results": [], "shown_query": shown_query}
+            return {
+                "task": task,
+                "raw_results": [],
+                "shown_query": shown_query,
+                "attempted": False,
+                "rate_limited": False,
+                "skipped": "empty_query",
+            }
+
+        if abort_event.is_set():
+            return {
+                "task": task,
+                "raw_results": [],
+                "shown_query": shown_query,
+                "attempted": False,
+                "rate_limited": False,
+                "skipped": "rate_limit_abort",
+            }
+
+        if hasattr(jsearch, "is_temporarily_rate_limited") and jsearch.is_temporarily_rate_limited():
+            cooldown = jsearch.remaining_rate_limit_cooldown() if hasattr(jsearch, "remaining_rate_limit_cooldown") else 0
+            log.warning(
+                "Skipping JSearch query due to active 429 cooldown (%ds remaining): %s",
+                cooldown,
+                shown_query,
+            )
+            return {
+                "task": task,
+                "raw_results": [],
+                "shown_query": shown_query,
+                "attempted": False,
+                "rate_limited": True,
+                "skipped": "cooldown",
+            }
 
         async with sem:
+            if abort_event.is_set():
+                return {
+                    "task": task,
+                    "raw_results": [],
+                    "shown_query": shown_query,
+                    "attempted": False,
+                    "rate_limited": False,
+                    "skipped": "rate_limit_abort",
+                }
+
             log.info("🔍  Searching: %s", shown_query)
             try:
                 raw_results = await asyncio.to_thread(jsearch.search_jobs, query_text, location_text)
+            except JSearchRateLimitError as exc:
+                abort_event.set()
+                log.error("JSearch rate limit triggered for '%s': %s", shown_query, exc)
+                return {
+                    "task": task,
+                    "raw_results": [],
+                    "shown_query": shown_query,
+                    "attempted": True,
+                    "rate_limited": True,
+                    "skipped": "rate_limited",
+                }
             except Exception as exc:
                 log.warning("JSearch async worker failed for '%s': %s", shown_query, exc)
                 raw_results = []
@@ -670,6 +736,9 @@ async def _execute_jsearch_plan_async(
             "task": task,
             "raw_results": raw_results if isinstance(raw_results, list) else [],
             "shown_query": shown_query,
+            "attempted": True,
+            "rate_limited": False,
+            "skipped": "",
         }
 
     return await asyncio.gather(*[_worker(task) for task in query_plan])
@@ -725,6 +794,7 @@ async def _run_sources_async(
 async def _notify_url_changes_async(
     notifier: object,
     url_change_events: list[dict[str, object]],
+    record_to_sheets: bool = True,
 ) -> None:
     """Send URL-change alert and record rows concurrently."""
     if not url_change_events:
@@ -732,12 +802,84 @@ async def _notify_url_changes_async(
 
     tasks = [
         asyncio.to_thread(notifier.send_url_change_alert, url_change_events),
-        asyncio.to_thread(notifier.record_url_changes_in_sheet, url_change_events),
     ]
+    if record_to_sheets:
+        tasks.append(
+            asyncio.to_thread(
+                notifier.record_url_changes_in_sheet, url_change_events
+            )
+        )
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for result in results:
         if isinstance(result, Exception):
             log.error("URL change notification sub-task failed: %s", result)
+
+
+async def _search_internet_for_companies_async(
+    sheets_client: object | None,
+    links_file: str,
+    max_companies: int = 20,
+    max_results_per_company: int = 3,
+) -> bool:
+    """Search internet for job openings from companies in links.txt and log to Google Sheets."""
+    if sheets_client is None or search_internet_for_companies is None:
+        log.info("Internet job search skipped (Sheets or search module unavailable).")
+        return False
+
+    try:
+        log.info("Starting internet search for job openings from links.txt companies...")
+
+        # Run search in thread to avoid blocking
+        results = await asyncio.to_thread(
+            search_internet_for_companies,
+            links_file,
+            max_companies,
+            max_results_per_company,
+        )
+
+        if not results:
+            log.info("No internet search results obtained.")
+            return False
+
+        # Convert search results to career opening format for Google Sheets
+        opening_rows = []
+        for search_result in results:
+            company_name = search_result.get("company_name", "")
+            company_url = search_result.get("company_url", "")
+            timestamp = search_result.get("timestamp", "")
+            found_openings = search_result.get("found_openings", [])
+
+            for opening in found_openings:
+                row = {
+                    "timestamp": timestamp,
+                    "job_title": opening.get("title", ""),
+                    "company": company_name,
+                    "location": "",  # Not available from internet search
+                    "type": "",  # Not available
+                    "apply_link": opening.get("url", ""),
+                    "posted_date": "",  # Not available
+                    "source_url": company_url,
+                    "status": "New",
+                    "description": opening.get("description", ""),
+                }
+                if row.get("apply_link") and row.get("job_title"):
+                    opening_rows.append(row)
+
+        if opening_rows:
+            # Append to Google Sheets
+            appended_count = sheets_client.append_career_opening_rows(opening_rows)
+            log.info(
+                "Internet search: appended %d job openings to Google Sheets from %d companies.",
+                appended_count,
+                len(results),
+            )
+            return appended_count > 0
+
+        return False
+
+    except Exception as exc:
+        log.warning("Internet search for companies failed: %s", exc)
+        return False
 
 
 def _decode_base64_creds() -> str:
@@ -766,7 +908,10 @@ def _decode_base64_creds() -> str:
     return raw
 
 
-def _build_notification_manager(telegram_bot: TelegramBot, ai_client: GroqClient | None = None):
+def _build_notification_manager(
+    config: ConfigLoader,
+    ai_client: GroqClient | None = None,
+):
     """Build NotificationManager from environment setup."""
     from notification_manager import NotificationManager
 
@@ -793,11 +938,15 @@ def _build_notification_manager(telegram_bot: TelegramBot, ai_client: GroqClient
     sheet_link = f"https://docs.google.com/spreadsheets/d/{sheet_id}" if sheet_id else ""
 
     return NotificationManager(
-        telegram_bot=telegram_bot,
         sheets_client=sheets_client,
         email_notifier=email_notifier,
         sheet_link=sheet_link,
         ai_client=ai_client,
+        url_change_alert_max_events=int(config.get("url_change_alert_max_events", 12)),
+        url_change_max_events_per_cycle=int(config.get("url_change_max_events_per_cycle", 40)),
+        url_change_max_openings_per_event=int(config.get("url_change_max_openings_per_event", 15)),
+        url_change_max_openings_per_cycle=int(config.get("url_change_max_openings_per_cycle", 180)),
+        url_change_log_baseline_openings=_as_bool(config.get("url_change_log_baseline_openings", False), default=False),
     )
 
 
@@ -819,11 +968,25 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     config = ConfigLoader()
     state_mgr = StateManager(STATE_FILE, config.get("max_notified_ids"))
 
+    log.info(
+        "Effective JSearch settings: concurrency=%s, fail_fast_on_429=%s, retries=%s, cooldown=%ss",
+        config.get("jsearch_async_concurrency", 1),
+        config.get("jsearch_fail_fast_on_429", True),
+        config.get("jsearch_rate_limit_retries", 1),
+        config.get("jsearch_rate_limit_cooldown_seconds", 900),
+    )
+    log.info(
+        "Effective URL->Sheets settings: max_events=%s, max_openings_per_event=%s, max_openings_per_cycle=%s, baseline_openings=%s",
+        config.get("url_change_max_events_per_cycle", 200),
+        config.get("url_change_max_openings_per_event", 300),
+        config.get("url_change_max_openings_per_cycle", 5000),
+        config.get("url_change_log_baseline_openings", True),
+    )
+
     log.info("API usage this month: %d calls",
              state_mgr.state.get("api_usage", {}).get("count", 0))
 
     # 3. Build clients
-    telegram = TelegramBot()
     groq_ai = GroqClient(
         min_call_interval_seconds=config.get("groq_min_call_interval_seconds", 1.2),
         state_manager=state_mgr,
@@ -836,7 +999,12 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         ai_client=groq_ai,
         ai_confidence_threshold=config.get("ai_confidence_threshold", 70),
     )
-    jsearch = JSearchClient(timeout=config.get("request_timeout"))
+    jsearch = JSearchClient(
+        timeout=config.get("request_timeout"),
+        fail_fast_on_429=_as_bool(config.get("jsearch_fail_fast_on_429", True), default=True),
+        rate_limit_cooldown_seconds=int(config.get("jsearch_rate_limit_cooldown_seconds", 900)),
+        max_retries=max(1, int(config.get("jsearch_rate_limit_retries", 1))),
+    )
 
     career_scraper = None
     enable_playwright = _as_bool(config.get("enable_playwright_scraper", True), default=True)
@@ -858,21 +1026,15 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
             except Exception as exc:
                 log.warning("Failed to initialize career scraper stack; using requests fallback: %s", exc)
 
-    # Process telegram commands (e.g. /status, /pause) immediately
-    telegram.process_updates(state_mgr)
-
     if os.path.isfile(PAUSE_FILE):
-        log.info("⏸️  pause.txt created by bot — exiting gracefully.")
+        log.info("⏸️  pause.txt created by external logic — exiting gracefully.")
         return
 
     notifier = None
     try:
-        notifier = _build_notification_manager(telegram, ai_client=groq_ai)
+        notifier = _build_notification_manager(config=config, ai_client=groq_ai)
     except Exception as exc:
         log.error("Failed to build NotificationManager: %s", exc)
-
-    # Re-process /status so that it can access `notifier.health_check()`
-    telegram.process_updates(state_mgr, notifier=notifier)
 
     if args.test_mode:
         try:
@@ -906,46 +1068,52 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         max_companies=int(config.get("company_targeted_max_companies", 25)),
     )
 
-    jsearch_monthly_limit = int(config.get("jsearch_monthly_limit", 200))
-    jsearch_safety_buffer = int(config.get("jsearch_safety_buffer", 10))
-    jsearch_max_queries_per_run = int(config.get("jsearch_max_queries_per_run", 3))
-
-    remaining_monthly = state_mgr.get_remaining_api_requests(jsearch_monthly_limit)
-    allowed_this_run = max(
-        0,
-        min(
-            jsearch_max_queries_per_run,
-            remaining_monthly - jsearch_safety_buffer,
-        ),
-    )
-
-    log.info(
-        "JSearch budget: used=%d/%d, remaining=%d, allowed_this_run=%d",
-        state_mgr.get_api_usage_count(),
-        jsearch_monthly_limit,
-        remaining_monthly,
-        allowed_this_run,
-    )
-
-    if state_mgr.should_skip_due_to_rate_limit(jsearch_monthly_limit, jsearch_safety_buffer) or allowed_this_run <= 0:
-        log.error(
-            "JSearch quota protection active. Skipping API calls this run (monthly limit=%d, safety buffer=%d).",
-            jsearch_monthly_limit,
-            jsearch_safety_buffer,
-        )
-        titles = []
+    enable_jsearch_api = _as_bool(config.get("enable_jsearch_api", False), default=False)
+    if not enable_jsearch_api:
+        log.info("JSearch API disabled (enable_jsearch_api=false). Using links.txt scraping only.")
+        query_plan = []
         allowed_this_run = 0
+    else:
+        jsearch_monthly_limit = int(config.get("jsearch_monthly_limit", 200))
+        jsearch_safety_buffer = int(config.get("jsearch_safety_buffer", 10))
+        jsearch_max_queries_per_run = int(config.get("jsearch_max_queries_per_run", 3))
+
+        remaining_monthly = state_mgr.get_remaining_api_requests(jsearch_monthly_limit)
+        allowed_this_run = max(
+            0,
+            min(
+                jsearch_max_queries_per_run,
+                remaining_monthly - jsearch_safety_buffer,
+            ),
+        )
+
+        log.info(
+            "JSearch budget: used=%d/%d, remaining=%d, allowed_this_run=%d",
+            state_mgr.get_api_usage_count(),
+            jsearch_monthly_limit,
+            remaining_monthly,
+            allowed_this_run,
+        )
+
+        if state_mgr.should_skip_due_to_rate_limit(jsearch_monthly_limit, jsearch_safety_buffer) or allowed_this_run <= 0:
+            log.error(
+                "JSearch quota protection active. Skipping API calls this run (monthly limit=%d, safety buffer=%d).",
+                jsearch_monthly_limit,
+                jsearch_safety_buffer,
+            )
+            titles = []
+            allowed_this_run = 0
+
+        query_plan = build_jsearch_query_plan(
+            titles=titles,
+            locations=locations if isinstance(locations, list) else [],
+            company_hints=company_hints,
+            allowed_queries=allowed_this_run,
+            company_targeted_enabled=_as_bool(config.get("company_targeted_search_enabled", True), default=True),
+            company_max_queries=int(config.get("company_targeted_max_queries_per_run", 4)),
+        )
 
     all_qualified_jobs = []
-
-    query_plan = build_jsearch_query_plan(
-        titles=titles,
-        locations=locations if isinstance(locations, list) else [],
-        company_hints=company_hints,
-        allowed_queries=allowed_this_run,
-        company_targeted_enabled=_as_bool(config.get("company_targeted_search_enabled", True), default=True),
-        company_max_queries=int(config.get("company_targeted_max_queries_per_run", 4)),
-    )
 
     # 5. Run links.txt scraping + JSearch API side-by-side
     url_change_events, query_results = _run_async(
@@ -975,6 +1143,10 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         task = query_result.get("task") if isinstance(query_result.get("task"), dict) else {}
         query_text = str(task.get("query") or "").strip()
         if not query_text:
+            continue
+
+        attempted = bool(query_result.get("attempted", True))
+        if not attempted:
             continue
 
         source_tag = str(task.get("source") or "JSEARCH_API")
@@ -1023,12 +1195,185 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     if args.job_limit > 0:
         all_qualified_jobs = all_qualified_jobs[:args.job_limit]
 
-    # Deduplicate against state.json to find truly NEW jobs
-    new_jobs = filter_engine.deduplicate_jobs(all_qualified_jobs, state_mgr)
-    state_mgr.save_state()
+    # ── NEW: build job list from links.txt change events ────────────────
+    # This avoids noisy JSearch results and ensures we only notify jobs
+    # actually present on the career pages listed in `links.txt`.
+    url_based_qualified_jobs: list[dict[str, object]] = []
+    url_based_new_jobs: list[dict[str, object]] = []
+    url_based_new_job_ids: list[str] = []
+    url_based_seen_ids: set[str] = set()
+
+    # Cache job-details fetches per apply link (many job cards share links).
+    job_details_cache: dict[str, dict[str, str]] = {}
+    details_fetch_count = 0
+    details_fetch_cap = int(config.get("job_details_max_per_cycle", 20))
+    min_desc_chars = int(config.get("job_description_min_chars", 120))
+    url_change_log_baseline_openings = _as_bool(config.get("url_change_log_baseline_openings", True), default=True)
+
+    def _event_openings_to_consider(event: dict[str, object]) -> list[dict[str, object]]:
+        change_type = str(event.get("change_type") or "content_changed")
+        openings = event.get("new_openings")
+        if isinstance(openings, list) and openings:
+            return [o for o in openings if isinstance(o, dict)]
+        if change_type == "new_url_tracked" and url_change_log_baseline_openings:
+            base_openings = event.get("openings")
+            if isinstance(base_openings, list):
+                return [o for o in base_openings if isinstance(o, dict)]
+        return []
+
+    for event in url_change_events:
+        if len(url_based_new_jobs) >= details_fetch_cap:
+            break
+
+        event_url = str(event.get("url") or "")
+        event_domain = str(event.get("domain") or "")
+
+        for opening in _event_openings_to_consider(event):
+            opening_title = str(opening.get("title") or "").strip()
+            opening_link = str(opening.get("link") or opening.get("apply_link") or opening.get("job_url") or "").strip()
+
+            if not opening_title or not opening_link:
+                continue
+
+            apply_link_norm = normalize_apply_link(opening_link)
+            if not apply_link_norm:
+                continue
+
+            company = str(opening.get("company") or event_domain or "").strip()
+            location = str(opening.get("location") or "").strip()
+            job_type = str(opening.get("type") or opening.get("job_type") or "").strip()
+            posted_date_hint = str(opening.get("posted_date") or opening.get("posted_at") or "").strip()
+
+            # Structural validation before doing network calls.
+            if not is_valid_job_posting(
+                {
+                    "title": opening_title,
+                    "apply_link": apply_link_norm,
+                    "job_url": apply_link_norm,
+                    "source_url": event_url,
+                }
+            ):
+                continue
+
+            # Title-only role filter: cheap prefilter.
+            matched, matched_role, _score = matches_target_role(
+                opening_title,
+                description="",
+                target_roles=titles,
+                exclude_senior=True,
+            )
+            if not matched or not matched_role:
+                continue
+
+            # Fetch description snippet from the job details page (apply link).
+            if apply_link_norm in job_details_cache:
+                snippet = job_details_cache[apply_link_norm]
+            else:
+                if details_fetch_count >= details_fetch_cap:
+                    # Hard cap to keep runtime inside GitHub Actions budget.
+                    break
+                snippet = fetch_job_description_snippet(
+                    apply_link_norm,
+                    scraper=career_scraper,
+                    timeout_seconds=int(config.get("request_timeout", 15)),
+                    min_chars=min_desc_chars,
+                    max_chars=1500,
+                )
+                job_details_cache[apply_link_norm] = snippet
+                details_fetch_count += 1
+
+            description = str(snippet.get("description") or "").strip()
+            if len(description) < min_desc_chars:
+                continue
+
+            # Title + description semantic/keyword verification.
+            matched2, matched_role2, match_score = matches_target_role(
+                opening_title,
+                description=description,
+                target_roles=titles,
+                exclude_senior=True,
+            )
+            if not matched2 or not matched_role2:
+                continue
+
+            # Build stable job key and dedupe vs state.json.
+            job_id = stable_job_dedupe_key(opening_title, company, apply_link_norm)
+            job_row = job_dict_for_sheet(
+                title=opening_title,
+                company=company or event_domain,
+                location=location or "",
+                job_type=job_type or "",
+                posted_date=str(snippet.get("posted_date") or posted_date_hint or ""),
+                apply_link=apply_link_norm,
+                description=description,
+                matched_role=matched_role2,
+                match_score=float(match_score or 0),
+                source_url=event_url or str(event.get("resolved_url") or ""),
+            )
+            job_row["job_id"] = job_id  # internal use for state dedupe
+
+            url_based_qualified_jobs.append(job_row)
+
+            if job_id in url_based_seen_ids:
+                continue
+
+            if state_mgr.is_new_job(job_id):
+                url_based_seen_ids.add(job_id)
+                url_based_new_jobs.append(job_row)
+                url_based_new_job_ids.append(job_id)
+            # Stop if we've filled the per-cycle job cap for notifications.
+            if len(url_based_new_jobs) >= details_fetch_cap:
+                break
+
+        if len(url_based_new_jobs) >= details_fetch_cap:
+            break
+
+    # Prefer the URL-based pipeline (mission requirement: no noisy discovery).
+    if url_based_new_jobs:
+        all_qualified_jobs = url_based_qualified_jobs
+        new_jobs = url_based_new_jobs
+    else:
+        # Fallback to existing JSearch path only if URL-based extraction found nothing
+        # AND JSearch is enabled.
+        if enable_jsearch_api:
+            new_jobs = filter_engine.deduplicate_jobs(all_qualified_jobs, state_mgr)
+        else:
+            new_jobs = []
+
+    # Local audit output (title + description + link).
+    if new_jobs:
+        try:
+            output_dir = os.path.join(SCRIPT_DIR, "job_outputs")
+            os.makedirs(output_dir, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+
+            md_path = os.path.join(output_dir, f"new_jobs_{stamp}.md")
+            json_path = os.path.join(output_dir, f"new_jobs_{stamp}.json")
+
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(f"# New Jobs ({stamp} UTC)\n\n")
+                for j in new_jobs:
+                    f.write(f"## {j.get('job_title','').strip()}\n")
+                    f.write(f"- Apply: {j.get('apply_link','').strip()}\n")
+                    f.write(f"- Company: {j.get('employer_name','').strip()}\n")
+                    if j.get("location"):
+                        f.write(f"- Location: {j.get('location','').strip()}\n")
+                    f.write("\n")
+                    desc = str(j.get("description", "")).strip()
+                    if desc:
+                        f.write(desc + "\n\n")
+                    else:
+                        f.write("(No description captured)\n\n")
+
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(new_jobs, f, indent=2, ensure_ascii=False)
+
+            log.info("Wrote job output files: %s, %s", md_path, json_path)
+        except Exception as exc:
+            log.warning("Failed to write job output files: %s", exc)
 
     print("\n" + "=" * 60)
-    print("  JSEARCH JOB RESULTS")
+    print("  EXTRACTED JOB RESULTS")
     print(f"  Qualified jobs     : {len(all_qualified_jobs)}")
     print(f"  New (not notified) : {len(new_jobs)}")
     print("=" * 60 + "\n")
@@ -1041,15 +1386,55 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         elif notifier is not None:
             try:
                 if url_change_events:
-                    _run_async(_notify_url_changes_async(notifier, url_change_events))
+                    # Mission mode: avoid noisy "URL changes / Career Openings Log"
+                    # writes when we only want validated job postings.
+                    _run_async(
+                        _notify_url_changes_async(
+                            notifier,
+                            url_change_events,
+                            record_to_sheets=_as_bool(
+                                config.get("record_url_changes_to_sheets", False),
+                                default=False,
+                            ),
+                        )
+                    )
                 if new_jobs:
-                    notifier.notify_new_jobs(new_jobs)
+                    notify_result = notifier.notify_new_jobs(new_jobs)
+                    # Mark as notified only if at least one channel succeeded.
+                    if notify_result and any(bool(v) for v in notify_result.values()):
+                        for job_id in url_based_new_job_ids:
+                            state_mgr.mark_as_notified(job_id)
+                        state_mgr.save_state()
             except Exception as exc:
                 log.error("Notification pipeline crashed: %s", exc)
     else:
         log.info("Nothing to report — no URL changes and no new job matches.")
 
-    # 7. Commit State
+    # 7. Search internet for additional job openings from companies in links.txt
+    if not args.dry_run:
+        try:
+            sheets_client = None
+            if notifier is not None and hasattr(notifier, "_sheets"):
+                sheets_client = notifier._sheets
+
+            if sheets_client is not None:
+                enable_internet_search = _as_bool(
+                    config.get("enable_internet_company_search", True),
+                    default=True,
+                )
+                if enable_internet_search:
+                    _run_async(
+                        _search_internet_for_companies_async(
+                            sheets_client=sheets_client,
+                            links_file=LINKS_FILE,
+                            max_companies=int(config.get("internet_search_max_companies", 15)),
+                            max_results_per_company=int(config.get("internet_search_max_results_per_company", 3)),
+                        )
+                    )
+        except Exception as exc:
+            log.warning("Internet company search failed (non-fatal): %s", exc)
+
+    # 8. Commit State
     if not args.dry_run:
         state_mgr.commit_to_github()
 
@@ -1090,6 +1475,103 @@ def run_repeating_pipeline(
     return cycles
 
 
+def _run_test_url(url: str) -> None:
+    """Scrape a single URL, apply role filtering, and print results. No Sheets/Telegram."""
+    from config_loader import ConfigLoader
+
+    print(f"\n{'=' * 60}")
+    print(f"  TEST URL: {url}")
+    print(f"{'=' * 60}\n")
+
+    config = ConfigLoader()
+    titles = ConfigLoader.load_job_titles(JOBS_FILE)
+
+    # Try multi-strategy scraper
+    scraper = None
+    if MultiStrategyCareerScraper is not None:
+        try:
+            scraper = MultiStrategyCareerScraper(headless=True, timeout_ms=30_000)
+        except Exception as exc:
+            log.warning("Scraper init failed: %s", exc)
+
+    if scraper is not None:
+        result = scraper.scrape_site_openings_sync(url, max_pages=3, max_openings=50)
+    else:
+        # Fallback: requests + BS4
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0"}
+            resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            page_html = resp.text
+            all_jobs = extract_job_postings(page_html, url, max_results=50)
+            result = {"ok": True, "openings": [{"title": j.get("title", ""), "link": j.get("apply_link", "")} for j in all_jobs]}
+        except Exception as exc:
+            print(f"  ❌ Failed to fetch URL: {exc}")
+            return
+
+    if not result.get("ok"):
+        print(f"  ❌ Scrape failed: {result.get('error', 'unknown')}")
+        return
+
+    all_openings = result.get("openings", [])
+    print(f"  📋 Total openings extracted: {len(all_openings)}")
+
+    # Apply role filtering
+    filtered = filter_jobs_by_role(all_openings, target_roles=titles, min_score=50.0, exclude_senior=True)
+    print(f"  ✅ After role filtering: {len(filtered)}")
+
+    if not all_openings:
+        print("  (No openings found on this page)")
+        return
+
+    print(f"\n{'─' * 60}")
+    print("  ALL EXTRACTED OPENINGS:")
+    print(f"{'─' * 60}")
+    for i, opening in enumerate(all_openings[:30], 1):
+        title = opening.get("title", "?")
+        link = opening.get("link", "?")
+        matched, role, score = matches_target_role(title, target_roles=titles)
+        status = f"✅ {role} ({score:.0f})" if matched else "❌ filtered out"
+        print(f"  {i:3d}. {title}")
+        print(f"       Link: {link}")
+        print(f"       Status: {status}")
+
+    if filtered:
+        print(f"\n{'─' * 60}")
+        print("  ROLE-FILTERED RESULTS (these would be synced to Sheets):")
+        print(f"{'─' * 60}")
+        # Fetch descriptions for a small preview set only.
+        preview_limit = 8
+        for i, job in enumerate(filtered[:preview_limit], 1):
+            title = str(job.get("title", "")).strip()
+            link = str(job.get("link", "")).strip()
+            link_norm = normalize_apply_link(link)
+
+            description_preview = ""
+            if link_norm:
+                try:
+                    snippet = fetch_job_description_snippet(
+                        link_norm,
+                        scraper=scraper,
+                        timeout_seconds=int(config.get("request_timeout", 15)),
+                        min_chars=int(config.get("job_description_min_chars", 120)),
+                        max_chars=700,
+                    )
+                    description_preview = str(snippet.get("description", "")).strip()
+                except Exception as exc:
+                    log.warning("Job description preview failed: %s (%s)", link_norm, exc)
+
+            print(f"  {i:3d}. {title}")
+            print(f"       Matched: {job.get('matched_role', '?')} (score: {job.get('match_score', 0)})")
+            print(f"       Link: {link_norm or link}")
+            if description_preview:
+                print(f"       Desc: {description_preview[:220]}...")
+            else:
+                print(f"       Desc: (not captured)")
+
+    print(f"\n{'=' * 60}\n")
+
+
 def main() -> None:
     load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
@@ -1114,11 +1596,22 @@ def main() -> None:
         default=0,
         help="Optional cap for repeated mode (0 = unlimited). Useful for testing.",
     )
+    parser.add_argument(
+        "--test-url",
+        type=str,
+        default="",
+        help="Test scraping a single URL: extract and role-filter openings, print results, then exit.",
+    )
     args = parser.parse_args()
 
     if args.every_hours > 0 and (args.test_mode or args.health_check_only):
         log.info("Ignoring --every-hours in test/health-check mode (single cycle only).")
         args.every_hours = 0.0
+
+    # ── --test-url: scrape a single URL, apply role filter, print results ──
+    if args.test_url:
+        _run_test_url(args.test_url)
+        return
 
     run_repeating_pipeline(
         lambda cycle: _run_single_cycle(args, cycle_number=cycle),

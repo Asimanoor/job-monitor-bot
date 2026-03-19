@@ -7,14 +7,43 @@ import requests
 log = logging.getLogger(__name__)
 
 
+class JSearchRateLimitError(Exception):
+    """Raised when JSearch responds with 429 and fail-fast mode is enabled."""
+
+
 class JSearchClient:
     def __init__(
-        self, api_key: str | None = None, base_url: str = "https://jsearch.p.rapidapi.com/search", timeout: int = 30
+        self,
+        api_key: str | None = None,
+        base_url: str = "https://jsearch.p.rapidapi.com/search",
+        timeout: int = 30,
+        fail_fast_on_429: bool = True,
+        rate_limit_cooldown_seconds: int = 900,
+        max_retries: int = 1,
     ):
         self.api_key = api_key or os.environ.get("JSEARCH_API_KEY", "").strip()
         self.base_url = base_url
         self.timeout = timeout
         self.session = requests.Session()
+        self.fail_fast_on_429 = bool(fail_fast_on_429)
+        self.rate_limit_cooldown_seconds = max(30, int(rate_limit_cooldown_seconds))
+        self.max_retries = max(1, int(max_retries))
+        self._rate_limited_until = 0.0
+
+    def is_temporarily_rate_limited(self) -> bool:
+        """Return True if client is in cooldown window due to recent 429."""
+        return time.time() < float(self._rate_limited_until)
+
+    def remaining_rate_limit_cooldown(self) -> int:
+        """Return remaining cooldown seconds (0 if not rate-limited)."""
+        return max(0, int(self._rate_limited_until - time.time()))
+
+    @staticmethod
+    def _parse_retry_after_seconds(resp: requests.Response, fallback_seconds: int) -> int:
+        retry_after = str(resp.headers.get("Retry-After", "")).strip()
+        if retry_after.isdigit():
+            return max(1, int(retry_after))
+        return max(1, int(fallback_seconds))
 
     def get_headers(self) -> dict[str, str]:
         if not self.api_key:
@@ -31,6 +60,15 @@ class JSearchClient:
             log.warning("JSEARCH_API_KEY not set — skipping API search.")
             return []
 
+        if self.is_temporarily_rate_limited():
+            remaining = self.remaining_rate_limit_cooldown()
+            log.warning(
+                "Skipping JSearch query during active 429 cooldown (%ds remaining): %s",
+                remaining,
+                query,
+            )
+            return []
+
         full_query = f"{query} in {location}" if location else query
         params = {"query": full_query, "page": str(
             page), "num_pages": str(num_pages)}
@@ -38,7 +76,7 @@ class JSearchClient:
         return self._make_request(params, headers, full_query)
 
     def _make_request(self, params: dict, headers: dict, query_context: str) -> list[dict]:
-        max_retries = 3
+        max_retries = self.max_retries
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -48,7 +86,17 @@ class JSearchClient:
                 )
 
                 if resp.status_code == 429:
-                    wait = 60  # rate limiting backoff
+                    wait = self._parse_retry_after_seconds(resp, self.rate_limit_cooldown_seconds)
+                    self._rate_limited_until = max(self._rate_limited_until, time.time() + wait)
+
+                    if self.fail_fast_on_429:
+                        log.error(
+                            "Rate limited (429) for '%s'. Entering cooldown for %ds and skipping remaining retries.",
+                            query_context,
+                            wait,
+                        )
+                        raise JSearchRateLimitError(f"429 rate limit for '{query_context}'")
+
                     log.warning("Rate limited (429). Retrying in %ds… (%d/%d)",
                                 wait, attempt, max_retries)
                     time.sleep(wait)

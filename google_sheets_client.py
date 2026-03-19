@@ -44,6 +44,7 @@ _SCOPES = [
 # Retry config for quota errors
 _QUOTA_RETRY_DELAY = 30   # seconds
 _QUOTA_MAX_RETRIES = 1
+_APPEND_BATCH_SIZE = 50
 
 # Auto-archive: jobs older than this many days (with non-'New' status) are archived
 AUTO_ARCHIVE_DAYS = 30
@@ -156,14 +157,9 @@ class GoogleSheetsClient:
                 raise
 
     def _ensure_header_row(self) -> None:
-        """Create the header row if the sheet is empty."""
+        """Ensure primary worksheet header exists without read-heavy checks."""
         if self._primary_header_checked:
             return
-
-        try:
-            first = self._ws.row_values(1)
-        except Exception:
-            first = []
 
         headers = [
             "Timestamp", "Job Title", "Company", "Location",
@@ -171,19 +167,7 @@ class GoogleSheetsClient:
             "Matched Keywords", "Status", "Notes", "AI_Score",
         ]
 
-        if not first or first[0] != "Timestamp":
-            self._retry_on_quota(self._ws.update, "A1:L1", [headers])
-            log.info("Created header row in worksheet.")
-            self._primary_header_checked = True
-            return
-
-        # Upgrade legacy header that does not include AI_Score.
-        if len(first) < len(headers) or first[:11] == headers[:11]:
-            if len(first) < 12 or first[11] != "AI_Score":
-                merged = (first + headers)[0:12]
-                merged[11] = "AI_Score"
-                self._retry_on_quota(self._ws.update, "A1:L1", [merged])
-                log.info("Updated header row to include AI_Score column.")
+        self._retry_on_quota(self._ws.update, "A1:L1", [headers])
 
         self._primary_header_checked = True
 
@@ -213,14 +197,8 @@ class GoogleSheetsClient:
             )
 
         if title not in self._header_initialized:
-            try:
-                first = ws.row_values(1)
-            except Exception:
-                first = []
-
-            if first != headers:
-                end_col = self._column_letter(len(headers))
-                self._retry_on_quota(ws.update, f"A1:{end_col}1", [headers])
+            end_col = self._column_letter(len(headers))
+            self._retry_on_quota(ws.update, f"A1:{end_col}1", [headers])
             self._header_initialized.add(title)
 
         self._worksheet_cache[title] = ws
@@ -280,7 +258,9 @@ class GoogleSheetsClient:
 
         append_rows_fn = getattr(ws, "append_rows", None)
         if callable(append_rows_fn):
-            self._retry_on_quota(append_rows_fn, rows, value_input_option="USER_ENTERED")
+            for i in range(0, len(rows), _APPEND_BATCH_SIZE):
+                chunk = rows[i: i + _APPEND_BATCH_SIZE]
+                self._retry_on_quota(append_rows_fn, chunk, value_input_option="USER_ENTERED")
             return len(rows)
 
         appended = 0
