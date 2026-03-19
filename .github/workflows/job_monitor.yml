@@ -2,8 +2,8 @@ name: Job Page Monitor
 
 on:
   schedule:
-    # Run every 8 hours
-    - cron: "0 */8 * * *"
+    # Run every 6 hours
+    - cron: "0 */6 * * *"
   workflow_dispatch: # Allow manual trigger from GitHub UI
 
 env:
@@ -13,7 +13,7 @@ permissions:
   contents: write # Needed to push state.json back
 
 concurrency:
-  group: job-monitor-8h
+  group: job-monitor-6h
   cancel-in-progress: false
 
 jobs:
@@ -87,10 +87,12 @@ jobs:
           URL_CHANGE_MAX_OPENINGS_PER_EVENT: "50"
           URL_CHANGE_MAX_OPENINGS_PER_CYCLE: "500"
           URL_CHANGE_LOG_BASELINE_OPENINGS: "true"
-          RECORD_URL_CHANGES_TO_SHEETS: "false"
+          RECORD_URL_CHANGES_TO_SHEETS: "true"
+          RECORD_SEARCH_ACTIVITY_TO_SHEETS: "true"
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           # Enable local semantic filter (sentence-transformers, free + local).
           ENABLE_SEMANTIC_FILTER: "true"
           SEMANTIC_MODEL_NAME: "sentence-transformers/all-MiniLM-L6-v2"
