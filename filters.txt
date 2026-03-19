@@ -17,6 +17,5 @@ software engineer
 python
 ai
 ml
-machine learning
 data science
 data scientist
