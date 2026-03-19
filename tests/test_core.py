@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 
 from filter_engine import FilterEngine
 from groq_client import GroqClient
+from job_scraper import is_valid_job_posting
 from monitor import (
     build_jsearch_query_plan,
     extract_company_hints_from_urls,
@@ -360,3 +361,73 @@ def test_build_jsearch_query_plan_prioritizes_company_targeted_then_generic():
     assert plan[2]["source"] == "JSEARCH_API"
     assert plan[0]["company"] == "educative"
     assert plan[1]["company"] == "tajir"
+
+
+def test_is_valid_job_posting_rejects_marketing_service_title():
+    payload = {
+        "title": "Data Modernization Services",
+        "apply_link": "https://example.com/careers/data-modernization-services",
+        "job_url": "https://example.com/careers/data-modernization-services",
+        "source_url": "https://example.com/careers",
+    }
+
+    assert is_valid_job_posting(payload) is False
+
+
+def test_record_url_changes_in_sheet_respects_event_and_opening_caps():
+    class DummySheets:
+        def __init__(self):
+            self.change_rows = []
+            self.opening_rows = []
+
+        def append_url_change_rows(self, change_rows: list[dict]) -> int:
+            self.change_rows.extend(change_rows)
+            return len(change_rows)
+
+        def append_career_opening_rows(self, opening_rows: list[dict]) -> int:
+            self.opening_rows.extend(opening_rows)
+            return len(opening_rows)
+
+    sheets = DummySheets()
+    manager = NotificationManager(
+        sheets_client=sheets,
+        url_change_max_events_per_cycle=1,
+        url_change_max_openings_per_event=1,
+        url_change_max_openings_per_cycle=1,
+        url_change_log_baseline_openings=True,
+    )
+
+    events = [
+        {
+            "url": "https://alpha.test/careers",
+            "domain": "alpha.test",
+            "change_type": "new_url_tracked",
+            "page_title": "Alpha Careers",
+            "openings": [
+                {"title": "Junior Software Engineer", "link": "https://alpha.test/jobs/1"},
+                {"title": "Associate Data Analyst", "link": "https://alpha.test/jobs/2"},
+            ],
+            "new_openings": [],
+            "total_openings": 2,
+            "new_openings_count": 0,
+        },
+        {
+            "url": "https://beta.test/careers",
+            "domain": "beta.test",
+            "change_type": "new_url_tracked",
+            "page_title": "Beta Careers",
+            "openings": [
+                {"title": "Junior QA Engineer", "link": "https://beta.test/jobs/1"},
+            ],
+            "new_openings": [],
+            "total_openings": 1,
+            "new_openings_count": 0,
+        },
+    ]
+
+    ok = manager.record_url_changes_in_sheet(events)
+
+    assert ok is True
+    assert len(sheets.change_rows) == 1
+    assert len(sheets.opening_rows) == 1
+    assert sheets.opening_rows[0]["job_title"] == "Junior Software Engineer"
