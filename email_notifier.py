@@ -305,18 +305,24 @@ class EmailNotifier:
             f"  • {ch}: {'❌ FAILED' if v is False else v}" for ch, v in health_results.items())
         plain = f"Health Check Warning — {now}\n\n{rows}\n\nPlease check your configuration."
 
+        html_rows = "".join(
+            (
+                "<tr>"
+                f"<td style='padding:6px 12px'><strong>{ch}</strong></td>"
+                f"<td style='padding:6px 12px;color:{'#e53e3e' if v is False else '#38a169'}'>"
+                f"{'❌ FAILED' if v is False else ('✅ OK' if v is True else str(v))}</td>"
+                "</tr>"
+            )
+            for ch, v in health_results.items()
+        )
+
         html = f"""\
 <html>
 <body style="font-family:Arial,sans-serif;color:#333">
   <h2 style="color:#e53e3e">⚠️ Job Monitor Health Warning</h2>
   <p style="color:#666">{now}</p>
   <table style="border-collapse:collapse">
-    {"".join(
-            f"<tr><td style='padding:6px 12px'><strong>{ch}</strong></td>"
-            f"<td style='padding:6px 12px;color:{"#e53e3e" if v is False else "#38a169"}'>"
-            f"{'❌ FAILED' if v is False else ('✅ OK' if v is True else str(v))}</td></tr>"
-            for ch, v in health_results.items()
-        )}
+    {html_rows}
   </table>
 </body>
 </html>"""

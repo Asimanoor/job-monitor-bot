@@ -16,6 +16,7 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Protocol
+from urllib.parse import urlparse
 
 from telegram_bot import TelegramBot
 
@@ -32,6 +33,8 @@ FAILED_ALERTS_FILE = os.path.join(
 
 class SheetsClient(Protocol):
     def append_job_row(self, job_data: dict) -> bool: ...
+    def append_url_change_row(self, change_data: dict) -> bool: ...
+    def append_career_opening_row(self, opening_data: dict) -> bool: ...
     def update_job_status(self, job_apply_link: str,
                           new_status: str, notes: str = "") -> bool: ...
 
@@ -99,6 +102,13 @@ class NotificationManager:
         if self._sheets is None:
             return False
 
+        source_tag = str(job.get("source") or "JSEARCH_API").strip() or "JSEARCH_API"
+        notes_raw = str(job.get("notes") or "").strip()
+        source_note = f"Source: {source_tag}"
+        notes = notes_raw
+        if source_note.lower() not in notes_raw.lower():
+            notes = f"{notes_raw} | {source_note}".strip(" |")
+
         job_data = {
             "timestamp":        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
             "job_title":        job.get("job_title", ""),
@@ -110,7 +120,7 @@ class NotificationManager:
             "description":      (job.get("description", "") or "")[:500],
             "matched_keywords": job.get("matched_as", ""),
             "status":           "New",
-            "notes":            "",
+            "notes":            notes,
             "ai_score":         job.get("ai_score", ""),
         }
 
@@ -124,6 +134,53 @@ class NotificationManager:
                 time.sleep(_SHEETS_RETRY_DELAY)
 
         return False
+
+    @staticmethod
+    def _normalize_url_change_events(changed_urls: list[Any]) -> list[dict[str, Any]]:
+        """Normalize incoming URL change payloads (legacy list[str] or structured list[dict])."""
+        events: list[dict[str, Any]] = []
+
+        for item in changed_urls:
+            if isinstance(item, str):
+                url = item.strip()
+                if not url:
+                    continue
+                events.append(
+                    {
+                        "url": url,
+                        "domain": urlparse(url).netloc,
+                        "change_type": "content_changed",
+                        "page_title": "",
+                        "openings": [],
+                        "new_openings": [],
+                        "total_openings": 0,
+                        "new_openings_count": 0,
+                    }
+                )
+                continue
+
+            if isinstance(item, dict):
+                url = str(item.get("url", "")).strip()
+                if not url:
+                    continue
+
+                openings = item.get("openings") if isinstance(item.get("openings"), list) else []
+                new_openings = item.get("new_openings") if isinstance(item.get("new_openings"), list) else []
+
+                events.append(
+                    {
+                        "url": url,
+                        "domain": str(item.get("domain") or urlparse(url).netloc),
+                        "change_type": str(item.get("change_type") or "content_changed"),
+                        "page_title": str(item.get("page_title") or ""),
+                        "openings": openings,
+                        "new_openings": new_openings,
+                        "total_openings": int(item.get("total_openings") or len(openings)),
+                        "new_openings_count": int(item.get("new_openings_count") or len(new_openings)),
+                    }
+                )
+
+        return events
 
     # ── failed_alerts.json fallback ──────────────────────────────────────
     @staticmethod
@@ -215,19 +272,232 @@ class NotificationManager:
         log.info("Notification results: %s", result)
         return result
 
-    def send_url_change_alert(self, changed_urls: list[str]) -> bool:
-        if not changed_urls:
+    def send_url_change_alert(self, changed_urls: list[Any]) -> bool:
+        events = self._normalize_url_change_events(changed_urls)
+        if not events:
             return True
-        url_list = "\n".join(f"• {u}" for u in changed_urls)
+
+        lines: list[str] = []
+        sample_positions: list[str] = []
+
+        for event in events[:20]:
+            url = str(event.get("url", ""))
+            change_type = str(event.get("change_type", "content_changed"))
+            total = int(event.get("total_openings", 0) or 0)
+            new_count = int(event.get("new_openings_count", 0) or 0)
+
+            if new_count > 0:
+                lines.append(f"• {url} (new openings: {new_count}, detected: {total})")
+            else:
+                lines.append(f"• {url} ({change_type})")
+
+            new_openings = event.get("new_openings") if isinstance(event.get("new_openings"), list) else []
+            for opening in new_openings[:2]:
+                if isinstance(opening, dict):
+                    title = str(opening.get("title", "")).strip()
+                    link = str(opening.get("link", "")).strip()
+                    if title and link:
+                        sample_positions.append(f"• {title} — {link}")
+
+        opening_summary = ""
+        if sample_positions:
+            preview = "\n".join(sample_positions[:8])
+            opening_summary = f"\n\n<b>Sample newly detected openings:</b>\n{preview}"
+
+        url_list = "\n".join(lines)
         text = (
-            "🚨 <b>Job Page Update Detected!</b>\n\n"
+            "🚨 <b>Career Page Update Detected!</b>\n\n"
             "The following pages have changed:\n"
-            f"{url_list}\n\n"
-            "Please check immediately."
+            f"{url_list}{opening_summary}\n\n"
+            "All changes and detected openings are being logged to Google Sheets."
         )
         if self._tg:
             return self._tg.send_message(text)
         return False
+
+    def record_url_changes_in_sheet(self, changed_urls: list[Any]) -> bool:
+        """Persist URL page-change events and detected openings to Sheets."""
+        events = self._normalize_url_change_events(changed_urls)
+        if not events or self._sheets is None:
+            return False
+
+        appended_changes = 0
+        appended_openings = 0
+        appended_primary_rows = 0
+
+        for event in events:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            url = str(event.get("url", ""))
+            domain = str(event.get("domain") or urlparse(url).netloc or "Unknown")
+            page_title = str(event.get("page_title", ""))
+            change_type = str(event.get("change_type", "content_changed"))
+            scraper_used = str(event.get("scraper_used") or "unknown")
+            resolved_url = str(event.get("resolved_url") or "")
+
+            new_openings = event.get("new_openings") if isinstance(event.get("new_openings"), list) else []
+            all_openings = event.get("openings") if isinstance(event.get("openings"), list) else []
+            total_openings = int(event.get("total_openings", len(all_openings)) or 0)
+            new_openings_count = int(event.get("new_openings_count", len(new_openings)) or 0)
+
+            preview_titles = [
+                str(opening.get("title", "")).strip()
+                for opening in new_openings[:5]
+                if isinstance(opening, dict) and str(opening.get("title", "")).strip()
+            ]
+
+            change_payload = {
+                "timestamp": now,
+                "url": url,
+                "domain": domain,
+                "change_type": change_type,
+                "page_title": page_title,
+                "total_openings": total_openings,
+                "new_openings_count": new_openings_count,
+                "new_opening_titles_preview": preview_titles,
+                "notes": f"Automated career-page hash change monitor (source=links.txt, scraper={scraper_used})",
+            }
+
+            wrote_change = False
+            append_url_change_fn = getattr(self._sheets, "append_url_change_row", None)
+            if callable(append_url_change_fn):
+                wrote_change = bool(append_url_change_fn(change_payload))
+            else:
+                fallback_row = {
+                    "timestamp": now,
+                    "job_title": "[URL Change Detected] Careers page updated",
+                    "company": domain,
+                    "location": "",
+                    "job_type": "",
+                    "posted_date": now[:10],
+                    "apply_link": url,
+                    "description": f"Change type: {change_type}. New openings: {new_openings_count}. Total detected: {total_openings}.",
+                    "matched_keywords": "URL_MONITOR",
+                    "status": "URL Changed",
+                    "notes": ", ".join(preview_titles)[:300],
+                    "ai_score": "",
+                }
+                wrote_change = self._sheets.append_job_row(fallback_row)
+
+            if wrote_change:
+                appended_changes += 1
+
+            openings_to_log = new_openings if new_openings else (all_openings if change_type == "new_url_tracked" else [])
+            append_opening_fn = getattr(self._sheets, "append_career_opening_row", None)
+            append_primary_fn = getattr(self._sheets, "append_job_row", None)
+
+            # If no concrete opening is extractable, still append a summary change row in the primary sheet.
+            if not openings_to_log and callable(append_primary_fn) and callable(append_url_change_fn):
+                summary_ok = bool(
+                    append_primary_fn(
+                        {
+                            "timestamp": now,
+                            "job_title": "[LINKS.TXT CHANGE] Career page changed",
+                            "company": domain,
+                            "location": "",
+                            "job_type": "Career Page Monitor",
+                            "posted_date": now[:10],
+                            "apply_link": resolved_url or url,
+                            "description": f"Career page changed. Source URL: {url}. Change type: {change_type}. Openings detected: {total_openings}.",
+                            "matched_keywords": "LINKS_TXT_CHANGE",
+                            "status": "URL Changed",
+                            "notes": f"Source: links.txt | Career URL: {url} | Scraper: {scraper_used} | Page title: {page_title[:120]}",
+                            "ai_score": "",
+                        }
+                    )
+                )
+                if summary_ok:
+                    appended_primary_rows += 1
+
+            for opening in openings_to_log:
+                if not isinstance(opening, dict):
+                    continue
+
+                opening_title = str(opening.get("title", "")).strip()
+                opening_link = str(opening.get("link", "")).strip() or url
+                if not opening_title:
+                    continue
+
+                wrote_opening = False
+                if callable(append_opening_fn):
+                    wrote_opening = bool(
+                        append_opening_fn(
+                            {
+                                "timestamp": now,
+                                "source_url": url,
+                                "domain": domain,
+                                "position_title": opening_title,
+                                "position_link": opening_link,
+                                "change_type": change_type,
+                                "page_title": page_title,
+                                "is_new": opening in new_openings,
+                                "notes": f"Detected from careers page content (source=links.txt, scraper={scraper_used})",
+                            }
+                        )
+                    )
+                else:
+                    wrote_opening = self._sheets.append_job_row(
+                        {
+                            "timestamp": now,
+                            "job_title": opening_title,
+                            "company": domain,
+                            "location": "",
+                            "job_type": "",
+                            "posted_date": now[:10],
+                            "apply_link": opening_link,
+                            "description": f"Detected from changed careers page: {url}",
+                            "matched_keywords": "URL_OPENING",
+                            "status": "Opening Detected",
+                            "notes": page_title[:250],
+                            "ai_score": "",
+                        }
+                    )
+
+                wrote_primary = False
+                if callable(append_primary_fn) and callable(append_opening_fn):
+                    status = "Changed Opening" if opening in new_openings else "Tracked Opening"
+                    wrote_primary = bool(
+                        append_primary_fn(
+                            {
+                                "timestamp": now,
+                                "job_title": opening_title,
+                                "company": domain,
+                                "location": "",
+                                "job_type": "Career Page Monitor",
+                                "posted_date": now[:10],
+                                "apply_link": opening_link,
+                                "description": (
+                                    f"Detected from links.txt monitored career page. "
+                                    f"Source URL: {url}. Change type: {change_type}."
+                                ),
+                                "matched_keywords": "LINKS_TXT_CHANGE",
+                                "status": status,
+                                "notes": (
+                                    f"Source: links.txt | Career URL: {url} | "
+                                    f"Resolved URL: {resolved_url or url} | Scraper: {scraper_used} | "
+                                    f"Position URL: {opening_link}"
+                                )[:500],
+                                "ai_score": "",
+                            }
+                        )
+                    )
+
+                if wrote_primary:
+                    appended_primary_rows += 1
+
+                if wrote_opening:
+                    appended_openings += 1
+
+        if appended_changes < len(events):
+            log.warning("Sheets URL change logging partial success: %d/%d", appended_changes, len(events))
+
+        log.info(
+            "Sheets URL logging summary: change rows=%d/%d, opening rows=%d, primary rows=%d",
+            appended_changes,
+            len(events),
+            appended_openings,
+            appended_primary_rows,
+        )
+        return appended_changes > 0
 
     def update_job_in_sheet(
         self, apply_link: str, status: str, notes: str = "",

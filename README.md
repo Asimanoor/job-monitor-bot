@@ -58,7 +58,12 @@ cd Job-automate
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+python -m playwright install chromium
 ```
+
+Optional strategy packages included in `requirements.txt`:
+- `langchain` + `langchain-community` for recursive crawl fallback
+- `crewai` for post-processing/normalization fallback layer
 
 ### 2. Configure Secrets
 
@@ -75,7 +80,21 @@ EMAIL_SENDER=your.email@gmail.com
 EMAIL_APP_PASSWORD=your_16_char_app_password
 EMAIL_RECIPIENT=your.email@gmail.com
 GROQ_API_KEY=your_groq_api_key
+ENABLE_PLAYWRIGHT_SCRAPER=true
+ENABLE_LANGCHAIN_SCRAPER=true
+ENABLE_CREWAI_SCRAPER=true
+COMPANY_TARGETED_SEARCH_ENABLED=true
+COMPANY_TARGETED_MAX_COMPANIES=90
+COMPANY_TARGETED_MAX_QUERIES_PER_RUN=4
+LINK_SCRAPER_MAX_PAGES=8
+LINK_SCRAPER_MAX_OPENINGS_PER_SITE=300
+PLAYWRIGHT_MAX_OPENINGS_PER_PAGE=120
 ```
+
+Company targeting behavior:
+- `links.txt` domains are parsed to infer company hints (e.g., Lever/Workable/Ashby/Breezy patterns).
+- JSearch runs company-targeted discovery first (`JSEARCH_COMPANY_TARGETED`) and then generic role/location searches.
+- Openings found while targeting a company but belonging to other employers are still kept (`JSEARCH_OTHER_COMPANY_DISCOVERY`).
 
 ### GROQ AI Setup
 
@@ -90,12 +109,21 @@ GROQ_API_KEY=your_groq_api_key
 2. Add it as GitHub Secret: `GOOGLE_CREDENTIALS_JSON`
 3. Follow [sheet_setup_guide.md](sheet_setup_guide.md) for formatting
 4. Follow [EMAIL_SETUP.md](EMAIL_SETUP.md) for Gmail App Password
+5. On first URL-change run, the bot auto-creates two extra worksheets:
+       - `URL Changes Log` (every detected career-page change)
+       - `Career Openings Log` (detected opening title + opening link)
 
 ### 4. Run
 
 ```bash
 # Normal run
 python monitor.py
+
+# Continuous local automation (every 8 hours)
+python monitor.py --every-hours 8
+
+# Automation smoke test: 2 quick cycles (for validation)
+python monitor.py --dry-run --every-hours 0.001 --max-cycles 2
 
 # Dry run (no notifications sent)
 python monitor.py --dry-run
@@ -112,7 +140,7 @@ Create `pause.txt` in the repo root to pause the bot. Delete it to resume.
 
 | Workflow | Schedule | Purpose |
 |---|---|---|
-| `job_monitor.yml` | Every 6 hours | Main job search + notify |
+| `job_monitor.yml` | Every 8 hours | Main job search + notify (links.txt company targeting first, plus Playwright → LangChain → CrewAI → BS4 fallback with pagination/related ATS traversal) |
 | `weekly_report.yml` | Sunday 9 AM PKT | Weekly summary + archive |
 
 ### Required Secrets
@@ -166,3 +194,6 @@ For sheet formatting and required headers, see [`sheet_setup_guide.md`](sheet_se
 ## License
 
 MIT
+
+
+

@@ -14,28 +14,40 @@ class StateManager:
 
     def load_state(self) -> dict:
         """Load state from JSON file, returning empty structure on any error."""
+        default_state = {
+            "notified_job_ids": [],
+            "api_usage": {"count": 0, "reset_month": ""},
+            "groq_usage": {"count": 0, "reset_day": ""},
+            "url_hashes": {},
+            "url_openings": {},
+        }
+
         if not os.path.isfile(self.filepath):
-            return {"notified_job_ids": [], "api_usage": {"count": 0, "reset_month": ""}, "url_hashes": {}}
+            return default_state
         try:
             with open(self.filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, dict):
                 log.warning("state.json root is not a dict. Starting fresh.")
-                return {"notified_job_ids": [], "api_usage": {"count": 0, "reset_month": ""}, "url_hashes": {}}
+                return default_state
 
             # Ensure proper keys
             if "notified_job_ids" not in data:
                 data["notified_job_ids"] = []
             if "api_usage" not in data:
                 data["api_usage"] = {"count": 0, "reset_month": ""}
+            if "groq_usage" not in data:
+                data["groq_usage"] = {"count": 0, "reset_day": ""}
             if "url_hashes" not in data:
                 data["url_hashes"] = {}
+            if "url_openings" not in data:
+                data["url_openings"] = {}
 
             return data
         except (json.JSONDecodeError, IOError, OSError) as exc:
             log.warning(
                 "Could not read state file (%s). Starting fresh: %s", self.filepath, exc)
-            return {"notified_job_ids": [], "api_usage": {"count": 0, "reset_month": ""}, "url_hashes": {}}
+            return default_state
 
     def save_state(self) -> None:
         """Atomically save state: write to temp file then rename."""
@@ -54,6 +66,24 @@ class StateManager:
             log.info("State saved to %s", self.filepath)
         except OSError as exc:
             log.error("Failed to save state: %s", exc)
+
+    def _normalize_monthly_api_usage(self) -> None:
+        from datetime import datetime, timezone
+
+        usage = self.state.get("api_usage", {"count": 0, "reset_month": ""})
+        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+        if usage.get("reset_month") != current_month:
+            usage = {"count": 0, "reset_month": current_month}
+            self.state["api_usage"] = usage
+
+    def _normalize_daily_groq_usage(self) -> None:
+        from datetime import datetime, timezone
+
+        usage = self.state.get("groq_usage", {"count": 0, "reset_day": ""})
+        current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if usage.get("reset_day") != current_day:
+            usage = {"count": 0, "reset_day": current_day}
+            self.state["groq_usage"] = usage
 
     def _prune_notified_ids(self) -> None:
         """Keep only the most recent IDs to prevent unbounded growth."""
@@ -74,11 +104,18 @@ class StateManager:
             ids.append(job_id)
         self.state["notified_job_ids"] = ids
 
-    def should_skip_due_to_rate_limit(self, max_requests: int = 500) -> bool:
+    def should_skip_due_to_rate_limit(self, max_requests: int = 200, safety_buffer: int = 10) -> bool:
         """Check if API usage has exceeded the safe limit."""
-        usage = self.state.get("api_usage", {}).get("count", 0)
-        # buffer of 20
-        return usage >= (max_requests - 20)
+        usage = self.get_api_usage_count()
+        return usage >= max(0, (max_requests - safety_buffer))
+
+    def get_api_usage_count(self) -> int:
+        self._normalize_monthly_api_usage()
+        return int(self.state.get("api_usage", {}).get("count", 0) or 0)
+
+    def get_remaining_api_requests(self, max_requests: int = 200) -> int:
+        used = self.get_api_usage_count()
+        return max(0, int(max_requests) - used)
 
     def get_url_hash(self, url: str) -> str:
         """Get previous hash for URL."""
@@ -90,6 +127,33 @@ class StateManager:
         hashes[url] = hash_val
         self.state["url_hashes"] = hashes
 
+    def get_url_opening_fingerprints(self, url: str) -> set[str]:
+        """Return stored opening fingerprints for a URL."""
+        all_openings = self.state.get("url_openings", {})
+        raw = all_openings.get(url, [])
+        if not isinstance(raw, list):
+            return set()
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    def set_url_opening_fingerprints(self, url: str, fingerprints: list[str] | set[str], max_per_url: int = 300) -> None:
+        """Persist deduplicated opening fingerprints for a URL."""
+        cleaned: list[str] = []
+        seen: set[str] = set()
+
+        for fp in fingerprints:
+            token = str(fp).strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            cleaned.append(token)
+
+        if len(cleaned) > max_per_url:
+            cleaned = cleaned[:max_per_url]
+
+        all_openings = self.state.get("url_openings", {})
+        all_openings[url] = cleaned
+        self.state["url_openings"] = all_openings
+
     def get_last_telegram_update_id(self) -> int:
         """Get last processed telegram update ID."""
         return self.state.get("_tg_last_update_id", 0)
@@ -99,16 +163,31 @@ class StateManager:
         self.state["_tg_last_update_id"] = max(
             self.get_last_telegram_update_id(), update_id)
 
-    def track_api_usage(self) -> None:
+    def track_api_usage(self, amount: int = 1) -> None:
         """Increment API call count for the current month."""
-        from datetime import datetime, timezone
-
+        self._normalize_monthly_api_usage()
         usage = self.state.get("api_usage", {"count": 0, "reset_month": ""})
-        current_month = datetime.now(timezone.utc).strftime("%Y-%m")
-        if usage.get("reset_month") != current_month:
-            usage = {"count": 0, "reset_month": current_month}
-        usage["count"] += 1
+        usage["count"] += max(0, int(amount))
         self.state["api_usage"] = usage
+
+    def get_groq_usage_count(self) -> int:
+        self._normalize_daily_groq_usage()
+        return int(self.state.get("groq_usage", {}).get("count", 0) or 0)
+
+    def track_groq_usage(self, amount: int = 1) -> None:
+        """Increment GROQ call count for current UTC day."""
+        self._normalize_daily_groq_usage()
+        usage = self.state.get("groq_usage", {"count": 0, "reset_day": ""})
+        usage["count"] += max(0, int(amount))
+        self.state["groq_usage"] = usage
+
+    def get_remaining_groq_requests(self, max_requests: int = 500) -> int:
+        used = self.get_groq_usage_count()
+        return max(0, int(max_requests) - used)
+
+    def should_skip_groq_due_to_rate_limit(self, max_requests: int = 500, safety_buffer: int = 50) -> bool:
+        usage = self.get_groq_usage_count()
+        return usage >= max(0, (max_requests - safety_buffer))
 
     def commit_to_github(self) -> bool:
         """Commit the modified state.json back to GitHub."""

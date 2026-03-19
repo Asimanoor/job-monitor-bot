@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 log = logging.getLogger(__name__)
@@ -41,10 +42,16 @@ class GroqClient:
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
         min_call_interval_seconds: float = _MIN_CALL_INTERVAL_SECONDS,
+        state_manager=None,
+        daily_limit: int = 500,
+        safety_buffer: int = 50,
     ) -> None:
         self.api_key = (api_key or os.getenv("GROQ_API_KEY", "")).strip()
         self.model = model
         self.min_call_interval_seconds = max(0.0, float(min_call_interval_seconds))
+        self.state_manager = state_manager
+        self.daily_limit = int(daily_limit)
+        self.safety_buffer = int(safety_buffer)
         self._last_call_at = 0.0
 
         self._client = None
@@ -58,6 +65,29 @@ class GroqClient:
                 log.warning("Failed to initialize GROQ client. Using fallback only: %s", exc)
         else:
             log.info("GROQ disabled (missing key or package). Using fallback heuristics.")
+
+    def _normalize_daily_usage(self) -> None:
+        """Ensure GROQ usage is reset on a new UTC day."""
+        if self.state_manager is None:
+            return
+        usage = self.state_manager.state.get("groq_usage", {"count": 0, "reset_day": ""})
+        current_day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if usage.get("reset_day") != current_day:
+            self.state_manager.state["groq_usage"] = {"count": 0, "reset_day": current_day}
+
+    def _quota_allows_request(self) -> bool:
+        if self.state_manager is None:
+            return True
+
+        self._normalize_daily_usage()
+        if self.state_manager.should_skip_groq_due_to_rate_limit(self.daily_limit, self.safety_buffer):
+            remaining = self.state_manager.get_remaining_groq_requests(self.daily_limit)
+            log.warning(
+                "Skipping GROQ call to protect daily budget. Remaining requests today: %d",
+                remaining,
+            )
+            return False
+        return True
 
     # ── Internal helpers ────────────────────────────────────────────────
     def _throttle(self) -> None:
@@ -106,6 +136,9 @@ class GroqClient:
         if not self.enabled or self._client is None:
             return None
 
+        if not self._quota_allows_request():
+            return None
+
         self._throttle()
         try:
             completion = self._client.chat.completions.create(
@@ -118,6 +151,8 @@ class GroqClient:
                 response_format={"type": "json_object"},
             )
             self._last_call_at = time.monotonic()
+            if self.state_manager is not None:
+                self.state_manager.track_groq_usage()
             content = ""
             if completion.choices and completion.choices[0].message:
                 content = completion.choices[0].message.content or ""
@@ -128,7 +163,8 @@ class GroqClient:
 
     # ── Fallback logic ──────────────────────────────────────────────────
     def _fallback_classification(self, job_title: str, description: str) -> dict[str, Any]:
-        text = f"{job_title} {description}".lower()
+        title_text = (job_title or "").lower()
+        text = f"{title_text} {description}".lower()
 
         senior_signals = [
             "senior", "sr.", "lead", "manager", "principal", "director",
@@ -139,7 +175,16 @@ class GroqClient:
             "new grad", "trainee", "intern",
         ]
 
-        years_match = re.search(r"\b([3-9]|\d{2})\+?\s*(years?|yrs?)\b", text)
+        # Strong positive title hint should win for fresh-grad roles unless title itself is senior.
+        if any(token in title_text for token in entry_signals) and not any(token in title_text for token in senior_signals):
+            return {
+                "is_entry_level": True,
+                "confidence": 55,
+                "source": "fallback",
+                "reason": "entry-level title hint detected",
+            }
+
+        years_match = re.search(r"\b([4-9]|\d{2})\+?\s*(years?|yrs?)\b", text)
         if any(token in text for token in senior_signals) or years_match:
             reason = "seniority keywords or high-experience requirement detected"
             return {

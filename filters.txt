@@ -2,17 +2,21 @@
 fresh
 junior
 entry level
+entry-level
 graduate
+new grad
+fresher
+associate
 0-1 years
 0-2 years
 no experience
 
-# Job Type (OR logic)
+# Job Type / role intent (OR logic)
 full-time
-
-
-# Location hints
-lahore
-pakistan
-remote
-work from home
+software engineer
+python
+ai
+ml
+machine learning
+data science
+data scientist

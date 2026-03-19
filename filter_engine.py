@@ -26,6 +26,16 @@ DESC_EXCLUDE_PATTERNS = [
 _DESC_EXCLUDE_RES = [re.compile(p, re.IGNORECASE)
                      for p in DESC_EXCLUDE_PATTERNS]
 
+ENTRY_LEVEL_TITLE_HINTS = [
+    "associate", "junior", "jr", "jr.", "graduate",
+    "trainee", "intern", "entry", "entry-level", "fresher", "new grad",
+]
+
+CONTEXT_ROLE_TERMS = [
+    "role", "position", "job", "hiring", "candidate", "responsibilities",
+    "requirements", "internship", "graduate", "entry", "associate",
+]
+
 TITLE_SYNONYMS: dict[str, list[str]] = {
     "AIML Engineer":    ["AI Engineer", "ML Engineer", "Machine Learning Engineer",
                          "AI/ML Engineer", "Artificial Intelligence Engineer"],
@@ -129,23 +139,83 @@ class FilterEngine:
 
         return False, ""
 
+    def _title_hint_match(self, job_title: str) -> str | None:
+        """Return matching entry-level hint from job title if present."""
+        title_lower = (job_title or "").lower()
+        for hint in ENTRY_LEVEL_TITLE_HINTS:
+            pattern = r"\b" + re.escape(hint.lower()) + r"\b"
+            if re.search(pattern, title_lower):
+                return hint
+        return None
+
+    def _contextual_sentence_match(self, description: str, filters: list[str]) -> str | None:
+        """Lightweight NLP-ish sentence check for nearby role-context words."""
+        if not description or not filters:
+            return None
+
+        sentences = [s.strip() for s in re.split(r"[.!?\n]+", description.lower()) if s.strip()]
+        for sentence in sentences:
+            if not any(term in sentence for term in CONTEXT_ROLE_TERMS):
+                continue
+            for f in filters:
+                kw = f.lower().strip()
+                if not kw:
+                    continue
+                if fuzz.partial_ratio(kw, sentence) >= 85:
+                    return f
+        return None
+
+    def _resolve_inclusion_match(self, job_title: str, description: str, filters: list[str]) -> tuple[str | None, str | None]:
+        """Resolve include keyword and match source for transparent logging."""
+        if not filters:
+            return "No filter", "no filter"
+
+        title_lower = (job_title or "").lower()
+        desc_lower = (description or "").lower()
+
+        # Rule 1: explicit include keyword in title
+        for f in filters:
+            kw = f.lower().strip()
+            if not kw:
+                continue
+            pattern = r"\b" + re.escape(kw) + r"\b"
+            if re.search(pattern, title_lower):
+                return f, "title match"
+
+        # Rule 2: explicit include keyword in description
+        for f in filters:
+            kw = f.lower().strip()
+            if not kw:
+                continue
+            pattern = r"\b" + re.escape(kw) + r"\b"
+            if re.search(pattern, desc_lower):
+                return f, "description match"
+
+        # Rule 3: secondary title indicator for entry-level roles
+        title_hint = self._title_hint_match(job_title)
+        if title_hint:
+            return title_hint, "title match"
+
+        # Rule 4: contextual sentence similarity (lightweight NLP-ish pass)
+        contextual = self._contextual_sentence_match(description, filters)
+        if contextual:
+            return contextual, "description match"
+
+        # Rule 5: broad fallback fuzzy check on combined text
+        combined = f"{job_title} {description}".lower()
+        for f in filters:
+            if fuzz.token_set_ratio(f.lower(), combined) >= max(70, self.fuzzy_threshold):
+                return f, "description match"
+
+        return None, None
+
     def passes_inclusion_filters(self, job_title: str, description: str, filters: list[str]) -> str | None:
         """
         Return first matching include keyword found in title OR description.
         If filters empty, returns 'No filter'.
         """
-        if not filters:
-            return "No filter"
-        combined = f"{job_title} {description}".lower()
-        for f in filters:
-            if f.lower() in combined:
-                return f
-        # Requirement: ">= 70% for description" fuzzy matching for keywords
-        # Also fall back to fuzzy match against include_keywords
-        for f in filters:
-            if fuzz.token_set_ratio(f.lower(), combined) >= 70:
-                return f
-        return None
+        keyword, _source = self._resolve_inclusion_match(job_title, description, filters)
+        return keyword
 
     def is_recent(self, posted_at: str) -> bool:
         """Return True if within max_age_days or missing/unparseable."""
@@ -168,8 +238,12 @@ class FilterEngine:
         if excluded:
             return False
 
-        included = self.passes_inclusion_filters(
-            job_title, description, include_keywords)
+        # Additional explicit excludes passed by caller (legacy behavior support)
+        text = f"{job_title} {description}".lower()
+        if any((kw or "").lower() in text for kw in exclude_keywords):
+            return False
+
+        included, _source = self._resolve_inclusion_match(job_title, description, include_keywords)
         return bool(included)
 
     def calculate_relevance_score(self, job: dict, search_query: str) -> int:
@@ -220,12 +294,13 @@ class FilterEngine:
             log.info("   ❌ Excluded '%s' — %s", job_title, reason)
             return None
 
-        filter_match = self.passes_inclusion_filters(
-            job_title, description, filters)
+        filter_match, include_source = self._resolve_inclusion_match(job_title, description, filters)
         if not filter_match:
             log.info(
                 "   ❌ Excluded '%s' — no inclusion-filter keyword found", job_title)
             return None
+
+        log.info("   ✅ Included '%s' — Included: %s ('%s')", job_title, include_source, filter_match)
 
         if not self.is_recent(posted_at):
             log.info("   ❌ Excluded '%s' — older than %d days",
@@ -246,26 +321,37 @@ class FilterEngine:
             "reason": "AI disabled",
         }
 
+        title_hint = self._title_hint_match(job_title)
+
         # Secondary AI validation (after all keyword/age checks to save API credits).
         if self.ai_client is not None:
-            ai_level = self.ai_client.classify_job_level(job_title, description)
-            if not ai_level.get("is_entry_level", False):
-                log.info(
-                    "   ❌ Excluded '%s' — AI classified as non-entry-level (%s)",
-                    job_title,
-                    ai_level.get("reason", "n/a"),
-                )
-                return None
+            if title_hint:
+                # Preserve clearly entry-level title intents and save AI calls.
+                ai_level = {
+                    "is_entry_level": True,
+                    "confidence": 95,
+                    "source": "title-hint",
+                    "reason": f"title contains '{title_hint}'",
+                }
+            else:
+                ai_level = self.ai_client.classify_job_level(job_title, description)
+                if not ai_level.get("is_entry_level", False):
+                    log.info(
+                        "   ❌ Excluded '%s' — AI classified as non-entry-level (%s)",
+                        job_title,
+                        ai_level.get("reason", "n/a"),
+                    )
+                    return None
 
-            ai_confidence = int(ai_level.get("confidence", 0) or 0)
-            if ai_confidence < self.ai_confidence_threshold:
-                log.info(
-                    "   ❌ Excluded '%s' — AI confidence %d below threshold %d",
-                    job_title,
-                    ai_confidence,
-                    self.ai_confidence_threshold,
-                )
-                return None
+                ai_confidence = int(ai_level.get("confidence", 0) or 0)
+                if ai_confidence < self.ai_confidence_threshold:
+                    log.info(
+                        "   ❌ Excluded '%s' — AI confidence %d below threshold %d",
+                        job_title,
+                        ai_confidence,
+                        self.ai_confidence_threshold,
+                    )
+                    return None
 
             ai_match = self.ai_client.score_job_match(
                 description,
