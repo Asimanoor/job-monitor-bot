@@ -431,3 +431,154 @@ def test_record_url_changes_in_sheet_respects_event_and_opening_caps():
     assert len(sheets.change_rows) == 1
     assert len(sheets.opening_rows) == 1
     assert sheets.opening_rows[0]["job_title"] == "Junior Software Engineer"
+
+
+# ── Role Filter Tests ────────────────────────────────────────────────────────
+
+from role_filter import matches_target_role, filter_jobs_by_role
+
+def test_role_filter_matches_ai_engineer():
+    matched, role, score = matches_target_role("AI Engineer", "")
+    assert matched is True
+    assert role == "AI Engineer"
+    assert score == 100.0
+
+def test_role_filter_rejects_senior_roles():
+    """Verify senior roles are excluded by filter_jobs_by_role."""
+    jobs = [{"title": "Senior Data Scientist", "link": "https://test.com"}]
+    filtered = filter_jobs_by_role(jobs, exclude_senior=True)
+    assert len(filtered) == 0
+
+def test_role_filter_matches_associate_swe():
+    matched, role, score = matches_target_role("Associate Software Engineer", "")
+    assert matched is True
+    assert role == "Associate Software Engineer"
+
+def test_role_filter_rejects_non_tech():
+    matched, _, _ = matches_target_role("Content Manager", "")
+    assert matched is False
+
+def test_role_filter_synonym_match():
+    # Synonym match should pick up ML Engineer as Machine Learning Engineer
+    matched, role, score = matches_target_role("ML Engineer", "")
+    assert matched is True
+    assert role in ["Machine Learning Engineer", "AI Engineer"]
+
+
+def test_passes_semantic_filter_threshold_true(monkeypatch):
+    """
+    Unit test for `passes_semantic_filter` without downloading models.
+    We monkeypatch `sentence_transformers` with deterministic embeddings.
+    """
+    import types, sys
+    import role_filter
+
+    class DummyScalar:
+        def __init__(self, v: float):
+            self._v = float(v)
+
+        def item(self):
+            return self._v
+
+    class DummyVec:
+        def __init__(self, vals: list[float]):
+            self._vals = list(map(float, vals))
+
+        def max(self):
+            return DummyScalar(max(self._vals) if self._vals else 0.0)
+
+    class DummyModel:
+        def encode(self, texts, convert_to_tensor=True):
+            # Job embedding path: single string
+            if isinstance(texts, str):
+                # If the job text hints AI/ML, embed as [1], else [0].
+                key = texts.lower()
+                return [1.0] if ("ai" in key or "ml" in key) else [0.0]
+
+            # Role embeddings path: list[str]
+            role_vecs: list[list[float]] = []
+            for t in texts:
+                lt = str(t).lower()
+                role_vecs.append([1.0] if ("ai" in lt or "ml" in lt or "machine learning" in lt) else [0.0])
+            return role_vecs
+
+    def _cos_sim(job_embedding, role_embeddings):
+        # Compute cosine similarity for 1D embeddings.
+        # cos([a],[b]) is 1 if both are non-zero and positive; else 0.
+        a = float(job_embedding[0]) if job_embedding else 0.0
+        sims = []
+        for emb in role_embeddings:
+            b = float(emb[0]) if emb else 0.0
+            sims.append(1.0 if (a > 0.0 and b > 0.0) else 0.0)
+        return [DummyVec(sims)]
+
+    dummy_module = types.SimpleNamespace(
+        SentenceTransformer=lambda *_args, **_kwargs: DummyModel(),
+        util=types.SimpleNamespace(cos_sim=_cos_sim),
+    )
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", dummy_module)
+    monkeypatch.setenv("ENABLE_SEMANTIC_FILTER", "true")
+
+    assert role_filter.passes_semantic_filter(
+        title="AI Engineer",
+        description="Build ML models",
+        target_roles=["AI Engineer", "Data Scientist"],
+        threshold=0.65,
+    ) is True
+
+
+def test_passes_semantic_filter_threshold_false(monkeypatch):
+    """Same monkeypatched setup as above, but job text doesn't match roles."""
+    import types, sys
+    import role_filter
+
+    class DummyScalar:
+        def __init__(self, v: float):
+            self._v = float(v)
+
+        def item(self):
+            return self._v
+
+    class DummyVec:
+        def __init__(self, vals: list[float]):
+            self._vals = list(map(float, vals))
+
+        def max(self):
+            return DummyScalar(max(self._vals) if self._vals else 0.0)
+
+    class DummyModel:
+        def encode(self, texts, convert_to_tensor=True):
+            if isinstance(texts, str):
+                key = texts.lower()
+                return [1.0] if ("ai" in key or "ml" in key) else [0.0]
+
+            role_vecs: list[list[float]] = []
+            for t in texts:
+                lt = str(t).lower()
+                role_vecs.append([1.0] if ("ai" in lt or "ml" in lt or "machine learning" in lt) else [0.0])
+            return role_vecs
+
+    def _cos_sim(job_embedding, role_embeddings):
+        a = float(job_embedding[0]) if job_embedding else 0.0
+        sims = []
+        for emb in role_embeddings:
+            b = float(emb[0]) if emb else 0.0
+            sims.append(1.0 if (a > 0.0 and b > 0.0) else 0.0)
+        return [DummyVec(sims)]
+
+    dummy_module = types.SimpleNamespace(
+        SentenceTransformer=lambda *_args, **_kwargs: DummyModel(),
+        util=types.SimpleNamespace(cos_sim=_cos_sim),
+    )
+
+    monkeypatch.setitem(sys.modules, "sentence_transformers", dummy_module)
+    monkeypatch.setenv("ENABLE_SEMANTIC_FILTER", "true")
+
+    assert role_filter.passes_semantic_filter(
+        title="Content Manager",
+        description="Write content and run marketing promotions",
+        target_roles=["AI Engineer", "Data Scientist"],
+        threshold=0.65,
+    ) is False
+
