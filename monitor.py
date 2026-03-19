@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import requests
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -570,14 +571,16 @@ def monitor_urls(
     max_pages_per_site: int = 6,
     max_openings_per_page: int = 50,
     concurrency: int = 4,
-) -> list[dict[str, object]]:
+    return_activity: bool = False,
+) -> list[dict[str, object]] | tuple[list[dict[str, object]], list[dict[str, object]]]:
     """Check URLs from links.txt for content changes and extract opening details."""
     urls = ConfigLoader.load_urls(LINKS_FILE)
     if not urls:
         log.warning("No valid URLs to monitor.")
-        return []
+        return ([], []) if return_activity else []
 
     change_events: list[dict[str, object]] = []
+    activity_rows: list[dict[str, object]] = []
     errors = []
 
     old_hashes = {url: state_mgr.get_url_hash(url) for url in urls}
@@ -601,6 +604,23 @@ def monitor_urls(
     for result in results:
         target_url = str(result.get("url", ""))
         status = str(result.get("status", "error"))
+        event = result.get("event") if isinstance(result.get("event"), dict) else {}
+
+        activity_rows.append(
+            {
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "url": target_url,
+                "domain": str(event.get("domain") or urlparse(target_url).netloc),
+                "status": status,
+                "change_type": str(event.get("change_type") or status),
+                "total_openings": int(event.get("total_openings", 0) or 0),
+                "new_openings_count": int(event.get("new_openings_count", 0) or 0),
+                "scraper_used": str(event.get("scraper_used") or ""),
+                "pages_visited": event.get("pages_visited") if isinstance(event.get("pages_visited"), list) else [],
+                "error": str(result.get("error") or result.get("scraper_error") or ""),
+                "notes": "URL monitor cycle audit",
+            }
+        )
 
         if status == "error":
             log.error("%s: %s", target_url, result.get("error", "unknown error"))
@@ -637,7 +657,6 @@ def monitor_urls(
         if isinstance(new_fps, list):
             state_mgr.set_url_opening_fingerprints(target_url, new_fps)
 
-        event = result.get("event")
         if isinstance(event, dict):
             change_events.append(event)
 
@@ -647,6 +666,8 @@ def monitor_urls(
     print(f"  Changed  : {len(change_events)}")
     print(f"  Errors   : {len(errors)}")
     print("=" * 60 + "\n")
+    if return_activity:
+        return change_events, activity_rows
     return change_events
 
 
@@ -753,7 +774,7 @@ async def _run_sources_async(
     jsearch: JSearchClient,
     query_plan: list[dict[str, str]],
     jsearch_concurrency: int,
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     """Run links.txt monitoring and JSearch queries concurrently."""
     monitor_task = asyncio.to_thread(
         monitor_urls,
@@ -762,6 +783,7 @@ async def _run_sources_async(
         max_pages_per_site,
         max_openings_per_page,
         monitor_concurrency,
+        True,
     )
     jsearch_task = _execute_jsearch_plan_async(
         jsearch=jsearch,
@@ -776,10 +798,17 @@ async def _run_sources_async(
     )
 
     url_change_events: list[dict[str, object]] = []
+    activity_rows: list[dict[str, object]] = []
     query_results: list[dict[str, object]] = []
 
     if isinstance(monitor_result, Exception):
         log.error("URL monitoring crashed: %s", monitor_result)
+    elif isinstance(monitor_result, tuple) and len(monitor_result) == 2:
+        maybe_changes, maybe_activity = monitor_result
+        if isinstance(maybe_changes, list):
+            url_change_events = maybe_changes
+        if isinstance(maybe_activity, list):
+            activity_rows = maybe_activity
     elif isinstance(monitor_result, list):
         url_change_events = monitor_result
 
@@ -788,7 +817,7 @@ async def _run_sources_async(
     elif isinstance(jsearch_result, list):
         query_results = jsearch_result
 
-    return url_change_events, query_results
+    return url_change_events, query_results, activity_rows
 
 
 async def _notify_url_changes_async(
@@ -1116,7 +1145,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     all_qualified_jobs = []
 
     # 5. Run links.txt scraping + JSearch API side-by-side
-    url_change_events, query_results = _run_async(
+    url_change_events, query_results, monitor_activity_rows = _run_async(
         _run_sources_async(
             state_mgr=state_mgr,
             scraper=career_scraper,
@@ -1409,6 +1438,14 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 log.error("Notification pipeline crashed: %s", exc)
     else:
         log.info("Nothing to report — no URL changes and no new job matches.")
+
+    if not args.dry_run and notifier is not None and monitor_activity_rows:
+        record_search_activity = _as_bool(config.get("record_search_activity_to_sheets", True), default=True)
+        if record_search_activity and hasattr(notifier, "record_search_activity_in_sheet"):
+            try:
+                notifier.record_search_activity_in_sheet(monitor_activity_rows)
+            except Exception as exc:
+                log.warning("Search activity logging failed (non-fatal): %s", exc)
 
     # 7. Search internet for additional job openings from companies in links.txt
     if not args.dry_run:

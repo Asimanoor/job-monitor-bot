@@ -50,9 +50,11 @@ class ConfigLoader:
             "url_change_max_openings_per_event": 300,
             "url_change_max_openings_per_cycle": 5000,
             "url_change_log_baseline_openings": True,
-            # Job-only mission: do NOT write noisy URL-change-derived openings to Sheets
-            # unless explicitly enabled.
-            "record_url_changes_to_sheets": False,
+            # Persist URL change/opening logs to dedicated worksheets.
+            "record_url_changes_to_sheets": True,
+            # Write per-URL monitoring audit (searched/changed/ignored/error) to
+            # dedicated worksheet for full visibility.
+            "record_search_activity_to_sheets": True,
             "url_monitor_async_concurrency": 4,
             "jsearch_async_concurrency": 1,
             # How many matched jobs to enrich with full description per run
@@ -238,6 +240,10 @@ class ConfigLoader:
             }
         if "RECORD_URL_CHANGES_TO_SHEETS" in os.environ:
             self.config["record_url_changes_to_sheets"] = os.environ["RECORD_URL_CHANGES_TO_SHEETS"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "RECORD_SEARCH_ACTIVITY_TO_SHEETS" in os.environ:
+            self.config["record_search_activity_to_sheets"] = os.environ["RECORD_SEARCH_ACTIVITY_TO_SHEETS"].strip().lower() in {
                 "1", "true", "yes", "on"
             }
         if "URL_MONITOR_ASYNC_CONCURRENCY" in os.environ:

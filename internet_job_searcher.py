@@ -22,7 +22,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlparse, urljoin, parse_qs
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -100,8 +100,87 @@ class InternetJobSearcher:
     def _default_headers() -> dict[str, str]:
         """Return sensible default headers to avoid blocking."""
         return {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
         }
+
+    @staticmethod
+    def _clean_company_query(company_name: str) -> str:
+        cleaned = re.sub(r"[\-_+]+", " ", (company_name or "").strip())
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned
+
+    @staticmethod
+    def _normalize_result_url(url: str) -> str:
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+
+        if "duckduckgo.com/l/?" in raw:
+            parsed = urlparse(raw)
+            q = parse_qs(parsed.query)
+            uddg_values = q.get("uddg") or []
+            if uddg_values and uddg_values[0]:
+                raw = unquote(uddg_values[0])
+
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"}:
+            return ""
+
+        return parsed._replace(fragment="").geturl()
+
+    def _search_duckduckgo_query(self, query: str, max_results: int = 10) -> list[dict[str, str]]:
+        """Execute one DuckDuckGo query and parse result cards robustly."""
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        try:
+            url = "https://duckduckgo.com/html/"
+            params = {"q": query, "kl": "us-en"}
+
+            resp = self.session.get(url, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.content, "html.parser")
+
+            cards = soup.select("div.result")
+            if not cards:
+                cards = soup.select(".result.results_links.results_links_deep")
+
+            for card in cards:
+                if len(results) >= max_results:
+                    break
+
+                link_elem = card.select_one("a.result__a") or card.select_one("h2.result__title a")
+                if link_elem is None:
+                    continue
+
+                title = link_elem.get_text(" ", strip=True)
+                href = self._normalize_result_url(str(link_elem.get("href") or ""))
+                if not title or not href:
+                    continue
+
+                snippet_elem = card.select_one("a.result__snippet") or card.select_one("div.result__snippet")
+                snippet = snippet_elem.get_text(" ", strip=True) if snippet_elem else ""
+
+                dedupe_key = f"{href.lower()}|{title.lower()}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+
+                results.append(
+                    {
+                        "title": title,
+                        "url": href,
+                        "snippet": snippet,
+                        "source": "duckduckgo",
+                        "query": query,
+                    }
+                )
+        except Exception as exc:
+            log.warning("DuckDuckGo query failed for '%s': %s", query, exc)
+
+        return results
 
     def search_google(self, company_name: str, max_results: int = 10) -> list[dict[str, str]]:
         """
@@ -125,57 +204,92 @@ class InternetJobSearcher:
         Search DuckDuckGo for company job openings.
         DuckDuckGo is more accessible than Google for scraping.
         """
-        query = f"{company_name} careers jobs hiring"
-        results = []
+        clean_company = self._clean_company_query(company_name)
+        query_variants = [
+            f'"{clean_company}" careers jobs',
+            f"{clean_company} jobs",
+            f"{clean_company} hiring",
+        ]
+
+        merged: list[dict[str, str]] = []
+        seen: set[str] = set()
+
+        for query in query_variants:
+            partial = self._search_duckduckgo_query(query, max_results=max(3, max_results))
+            for item in partial:
+                key = f"{item.get('url', '').lower()}|{item.get('title', '').lower()}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+                if len(merged) >= max_results:
+                    break
+            if len(merged) >= max_results:
+                break
+
+        log.info("DuckDuckGo: found %d results for '%s'", len(merged), company_name)
+        return merged[:max_results]
+
+    def search_bing(self, company_name: str, max_results: int = 10) -> list[dict[str, str]]:
+        """Fallback search path using Bing HTML results."""
+        query = f'"{self._clean_company_query(company_name)}" careers jobs'
+        results: list[dict[str, str]] = []
+        seen: set[str] = set()
 
         try:
-            url = "https://duckduckgo.com/html/"
-            params = {"q": query, "kl": "us-en"}
-
-            resp = self.session.get(url, params=params, timeout=self.timeout)
+            resp = self.session.get(
+                "https://www.bing.com/search",
+                params={"q": query, "setlang": "en-US"},
+                timeout=self.timeout,
+            )
             resp.raise_for_status()
-
             soup = BeautifulSoup(resp.content, "html.parser")
 
-            # DuckDuckGo HTML search results: <div class="result">
-            for idx, result_div in enumerate(soup.find_all("div", class_="result")):
-                if idx >= max_results:
+            for card in soup.select("li.b_algo"):
+                if len(results) >= max_results:
                     break
 
-                try:
-                    # Extract title and link
-                    title_elem = result_div.find("a", class_="result__title")
-                    if not title_elem:
-                        continue
-
-                    title = title_elem.get_text(strip=True)
-                    result_url = title_elem.get("href", "").strip()
-
-                    if not title or not result_url:
-                        continue
-
-                    # Extract snippet
-                    snippet_elem = result_div.find("a", class_="result__snippet")
-                    snippet = snippet_elem.get_text(
-                        strip=True) if snippet_elem else ""
-
-                    results.append({
-                        "title": title,
-                        "url": result_url,
-                        "snippet": snippet,
-                        "source": "duckduckgo"
-                    })
-
-                except Exception as exc:
-                    log.debug("Failed to parse DuckDuckGo result: %s", exc)
+                link_elem = card.select_one("h2 a")
+                if link_elem is None:
                     continue
 
-            log.info("DuckDuckGo: found %d results for '%s'", len(results), company_name)
+                title = link_elem.get_text(" ", strip=True)
+                href = self._normalize_result_url(str(link_elem.get("href") or ""))
+                if not title or not href:
+                    continue
 
+                snippet_elem = card.select_one("p")
+                snippet = snippet_elem.get_text(" ", strip=True) if snippet_elem else ""
+
+                key = f"{href.lower()}|{title.lower()}"
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                results.append(
+                    {
+                        "title": title,
+                        "url": href,
+                        "snippet": snippet,
+                        "source": "bing",
+                        "query": query,
+                    }
+                )
+
+            log.info("Bing: found %d results for '%s'", len(results), company_name)
         except Exception as exc:
-            log.warning("DuckDuckGo search failed for '%s': %s", company_name, exc)
+            log.warning("Bing search failed for '%s': %s", company_name, exc)
 
         return results
+
+    def search_company_openings(self, company_name: str, max_results: int = 10) -> list[dict[str, str]]:
+        """Search across providers and return deduplicated result links."""
+        ddg_results = self.search_duckduckgo(company_name, max_results=max_results)
+        if ddg_results:
+            return ddg_results[:max_results]
+
+        bing_results = self.search_bing(company_name, max_results=max_results)
+        return bing_results[:max_results]
 
     def extract_job_links_from_results(
         self,
@@ -298,7 +412,7 @@ def search_internet_for_companies(
 
             # Search for openings
             log.info("Searching for openings: %s (from %s)", company_name, company_url)
-            search_results = searcher.search_duckduckgo(
+            search_results = searcher.search_company_openings(
                 company_name,
                 max_results=max_results_per_company * 2
             )

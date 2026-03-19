@@ -75,6 +75,21 @@ CAREER_OPENINGS_HEADERS = [
     "Status",
 ]
 
+SEARCH_ACTIVITY_WORKSHEET = "Search Activity Log"
+SEARCH_ACTIVITY_HEADERS = [
+    "Timestamp",
+    "Career Page URL",
+    "Domain",
+    "Status",
+    "Change Type",
+    "Total Openings Detected",
+    "New Openings Detected",
+    "Scraper Used",
+    "Pages Visited",
+    "Error",
+    "Notes",
+]
+
 
 class GoogleSheetsClient:
     """Read/write job records to a Google Sheet."""
@@ -340,6 +355,42 @@ class GoogleSheetsClient:
             return self._append_rows_optimized(ws, rows)
         except Exception as exc:
             log.error("Failed to append career opening rows: %s", exc)
+            return 0
+
+    @staticmethod
+    def _build_search_activity_row(activity_data: dict) -> list[Any]:
+        pages_visited = activity_data.get("pages_visited", 0)
+        if isinstance(pages_visited, list):
+            pages_visited = len(pages_visited)
+
+        return [
+            activity_data.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+            activity_data.get("url", ""),
+            activity_data.get("domain", ""),
+            activity_data.get("status", ""),
+            activity_data.get("change_type", ""),
+            activity_data.get("total_openings", 0),
+            activity_data.get("new_openings_count", 0),
+            activity_data.get("scraper_used", ""),
+            pages_visited,
+            activity_data.get("error", ""),
+            activity_data.get("notes", ""),
+        ]
+
+    def append_search_activity_row(self, activity_data: dict) -> bool:
+        """Append one monitor activity/audit row to dedicated worksheet."""
+        return self.append_search_activity_rows([activity_data]) > 0
+
+    def append_search_activity_rows(self, activity_rows: list[dict]) -> int:
+        """Append monitor activity rows in batch. Returns appended row count."""
+        if not activity_rows:
+            return 0
+        try:
+            ws = self._get_or_create_worksheet(SEARCH_ACTIVITY_WORKSHEET, SEARCH_ACTIVITY_HEADERS)
+            rows = [self._build_search_activity_row(item) for item in activity_rows]
+            return self._append_rows_optimized(ws, rows)
+        except Exception as exc:
+            log.error("Failed to append search activity rows: %s", exc)
             return 0
 
     def update_job_status(

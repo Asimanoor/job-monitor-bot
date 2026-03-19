@@ -30,8 +30,10 @@ Automated job monitoring system for fresh CS graduates. It watches `links.txt` c
                         ▼
        ┌────────────────────────────────┐
        │ Google Sheets Logger           │
-       │ (Career Openings Log)          │
-       │ • Title, Company, URL, Status  │
+       │ (Audit + Openings Logs)        │
+       │ • URL Changes Log              │
+       │ • Career Openings Log          │
+       │ • Search Activity Log          │
        └────────────────────────────────┘
 
 ┌──────────────────────────────────────────┐
@@ -100,6 +102,9 @@ PLAYWRIGHT_MAX_OPENINGS_PER_PAGE=120
 ENABLE_INTERNET_COMPANY_SEARCH=true
 INTERNET_SEARCH_MAX_COMPANIES=15
 INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY=3
+RECORD_URL_CHANGES_TO_SHEETS=true
+RECORD_SEARCH_ACTIVITY_TO_SHEETS=true
+HF_TOKEN=optional_huggingface_token
 ```
 
 ### GROQ AI Setup
@@ -118,6 +123,7 @@ INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY=3
 5. On first URL-change run, the bot auto-creates two extra worksheets:
        - `URL Changes Log` (every detected career-page change)
        - `Career Openings Log` (detected opening title + opening link)
+       - `Search Activity Log` (per-URL scan outcome: searched/changed/ignored/error)
 
 ### 4. Run
 
@@ -125,8 +131,8 @@ INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY=3
 # Normal run
 python monitor.py
 
-# Continuous local automation (every 8 hours)
-python monitor.py --every-hours 8
+# Continuous local automation (every 6 hours)
+python monitor.py --every-hours 6
 
 # Automation smoke test: 2 quick cycles (for validation)
 python monitor.py --dry-run --every-hours 0.001 --max-cycles 2
@@ -146,7 +152,7 @@ Create `pause.txt` in the repo root to pause the bot. Delete it to resume.
 
 | Workflow | Schedule | Purpose |
 |---|---|---|
-| `job_monitor.yml` | Every 8 hours | URL change monitoring (links.txt) + internet job search + Sheets logging |
+| `job_monitor.yml` | Every 6 hours | URL change monitoring (links.txt) + internet job search + Sheets logging |
 | `weekly_report.yml` | Sunday 9 AM PKT | Weekly summary + archive |
 
 ### Required Secrets
@@ -161,6 +167,7 @@ Create `pause.txt` in the repo root to pause the bot. Delete it to resume.
 | `EMAIL_APP_PASSWORD` | Gmail App Password (16-char, optional) |
 | `EMAIL_RECIPIENT` | Alert recipient email (optional) |
 | `GROQ_API_KEY` | GROQ API key for AI scoring/summaries |
+| `HF_TOKEN` | Optional Hugging Face token for higher model-download rate limits |
 
 ## Notification Chain
 
@@ -184,6 +191,8 @@ Configuration:
 - `ENABLE_INTERNET_COMPANY_SEARCH` (default: true)
 - `INTERNET_SEARCH_MAX_COMPANIES` (default: 15)
 - `INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY` (default: 3)
+- `RECORD_URL_CHANGES_TO_SHEETS` (default: true)
+- `RECORD_SEARCH_ACTIVITY_TO_SHEETS` (default: true)
 
 ## Troubleshooting
 

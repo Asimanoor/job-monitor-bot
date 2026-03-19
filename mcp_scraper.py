@@ -21,7 +21,7 @@ import logging
 import random
 import re
 from typing import Any
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -259,6 +259,92 @@ def _extract_pagination_links(base_url: str, html: str, max_links: int = 5) -> l
     return candidates
 
 
+def _extract_handoff_links(base_url: str, html: str, max_links: int = 6) -> list[str]:
+    """Extract likely cross-page handoff links (apply buttons, ATS redirects, scripted URLs)."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    base_parsed = urlparse(base_url)
+    base_host = base_parsed.netloc.lower().split(":")[0]
+
+    discovered: list[str] = []
+    seen: set[str] = set()
+
+    def _maybe_add(candidate: str) -> None:
+        if len(discovered) >= max(1, int(max_links)):
+            return
+
+        raw = (candidate or "").strip()
+        if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
+            return
+
+        absolute = urljoin(base_url, raw)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            return
+
+        host = parsed.netloc.lower().split(":")[0]
+        if not _is_related_pagination_domain(base_host, host):
+            return
+
+        absolute_lower = absolute.lower()
+        path_lower = parsed.path.lower()
+        query_keys = {k.lower() for k in parse_qs(parsed.query).keys()}
+        looks_careerish = (
+            any(host.endswith(hint) for hint in _ATS_DOMAIN_HINTS)
+            or any(
+                token in absolute_lower
+                for token in (
+                    "jobs", "job", "career", "careers", "position", "opening",
+                    "vacanc", "apply", "greenhouse", "lever", "workable", "ashby",
+                )
+            )
+            or {"job", "jobs", "career", "careers", "position", "opening"}.intersection(query_keys)
+            or path_lower.endswith("/jobs")
+            or path_lower.endswith("/careers")
+        )
+        if not looks_careerish:
+            return
+
+        token = absolute_lower.strip()
+        if token in seen:
+            return
+        seen.add(token)
+        discovered.append(absolute)
+
+    # 1) Direct candidate attributes from anchors/buttons/containers.
+    for node in soup.select("a[href], button[onclick], button[data-url], button[data-href], [role='button'][onclick], [data-link], [data-url], [data-href]"):
+        _maybe_add(str(node.get("href") or ""))
+        _maybe_add(str(node.get("data-url") or ""))
+        _maybe_add(str(node.get("data-href") or ""))
+        _maybe_add(str(node.get("data-link") or ""))
+
+        onclick = str(node.get("onclick") or "")
+        if onclick:
+            for match in re.findall(r"https?://[^\s'\"\)]+", onclick, flags=re.IGNORECASE):
+                _maybe_add(match)
+            for rel_match in re.findall(r"['\"](/[^'\"]+)['\"]", onclick):
+                _maybe_add(rel_match)
+
+    # 2) Fallback: parse script bodies for ATS/careers URLs.
+    script_pattern = re.compile(
+        r"https?://[^\s'\"\)]+(?:jobs?|careers?|positions?|openings?|apply|lever\.co|workable\.com|ashbyhq\.com|breezy\.hr|greenhouse\.io)[^\s'\"\)]*",
+        re.IGNORECASE,
+    )
+    for script in soup.find_all("script"):
+        script_text = script.string or script.get_text(" ", strip=True) or ""
+        if not script_text:
+            continue
+        for match in script_pattern.findall(script_text):
+            _maybe_add(unquote(match))
+
+        # Handle relative redirects like location.href='/jobs'.
+        for rel_match in re.findall(r"location\.(?:href|assign|replace)\(['\"]([^'\"]+)['\"]\)", script_text, flags=re.IGNORECASE):
+            _maybe_add(rel_match)
+        for rel_match in re.findall(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", script_text, flags=re.IGNORECASE):
+            _maybe_add(rel_match)
+
+    return discovered
+
+
 class LocalPlaywrightScraper:
     """Scrape dynamic pages using a local Chromium browser (headless by default)."""
 
@@ -285,19 +371,38 @@ class LocalPlaywrightScraper:
             "error": "",
         }
 
-        response = await page.goto(url, timeout=self.timeout_ms, wait_until=self.wait_until)
-        if response is not None:
-            result["status_code"] = response.status
-
         try:
-            await page.wait_for_load_state("networkidle", timeout=min(self.timeout_ms, 10_000))
-        except Exception:
-            pass
+            response = await page.goto(url, timeout=self.timeout_ms, wait_until=self.wait_until)
+            if response is not None:
+                result["status_code"] = response.status
 
-        result["final_url"] = str(page.url or url)
-        result["title"] = (await page.title()) or ""
-        result["html"] = await page.content()
-        result["ok"] = bool(result["html"])
+            try:
+                await page.wait_for_load_state("networkidle", timeout=min(self.timeout_ms, 10_000))
+            except Exception:
+                pass
+
+            result["final_url"] = str(page.url or url)
+            result["title"] = (await page.title()) or ""
+            result["html"] = await page.content()
+            result["ok"] = bool(result["html"])
+        except Exception as exc:
+            result["error"] = str(exc)
+            result["final_url"] = str(getattr(page, "url", "") or url)
+
+            # Some sites trigger a file download or redirect while loading.
+            # Keep this non-fatal so upper layers can continue with fallbacks.
+            try:
+                result["title"] = (await page.title()) or ""
+            except Exception:
+                pass
+            try:
+                html = await page.content()
+                if html:
+                    result["html"] = html
+                    result["ok"] = True
+            except Exception:
+                pass
+
         return result
 
     async def scrape_job(self, url: str) -> dict[str, Any]:
@@ -407,6 +512,12 @@ class LocalPlaywrightScraper:
 
                     page_data = await self._scrape_page(page, target)
                     if not page_data.get("ok"):
+                        # Follow any recovered final URL even when initial load failed.
+                        redirect_candidate = str(page_data.get("final_url") or "").strip()
+                        if redirect_candidate:
+                            token_redirect = redirect_candidate.lower().strip()
+                            if token_redirect not in seen_pages and redirect_candidate not in queue:
+                                queue.append(redirect_candidate)
                         continue
 
                     final_url = str(page_data.get("final_url") or target)
@@ -429,7 +540,8 @@ class LocalPlaywrightScraper:
                     if len(aggregated) >= max(1, int(max_openings)):
                         break
 
-                    for nxt in _extract_pagination_links(final_url, html):
+                    discovered_links = _extract_pagination_links(final_url, html) + _extract_handoff_links(final_url, html)
+                    for nxt in discovered_links:
                         nxt_token = nxt.lower().strip()
                         if nxt_token not in seen_pages and nxt not in queue:
                             queue.append(nxt)
@@ -532,7 +644,8 @@ class RequestsFallbackScraper:
             if len(collected) >= max(1, int(max_openings)):
                 break
 
-            for nxt in _extract_pagination_links(final_url, html):
+            discovered_links = _extract_pagination_links(final_url, html) + _extract_handoff_links(final_url, html)
+            for nxt in discovered_links:
                 nxt_token = nxt.lower().strip()
                 if nxt_token not in seen_pages and nxt not in queue:
                     queue.append(nxt)
@@ -608,7 +721,8 @@ class LangchainCareerScraper:
             if len(collected) >= max(1, int(max_openings)):
                 break
 
-            for nxt in _extract_pagination_links(final_url, html):
+            discovered_links = _extract_pagination_links(final_url, html) + _extract_handoff_links(final_url, html)
+            for nxt in discovered_links:
                 nxt_token = nxt.lower().strip()
                 if nxt_token not in seen_pages and nxt not in queue:
                     queue.append(nxt)
@@ -691,7 +805,8 @@ class CrewAICareerScraper:
             if len(aggregated) >= max(1, int(max_openings)):
                 break
 
-            for nxt in _extract_pagination_links(final_url, html):
+            discovered_links = _extract_pagination_links(final_url, html) + _extract_handoff_links(final_url, html)
+            for nxt in discovered_links:
                 nxt_token = nxt.lower().strip()
                 if nxt_token not in seen_pages and nxt not in queue:
                     queue.append(nxt)

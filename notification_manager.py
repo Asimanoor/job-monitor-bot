@@ -35,8 +35,10 @@ class SheetsClient(Protocol):
     def append_job_row(self, job_data: dict) -> bool: ...
     def append_url_change_row(self, change_data: dict) -> bool: ...
     def append_career_opening_row(self, opening_data: dict) -> bool: ...
+    def append_search_activity_row(self, activity_data: dict) -> bool: ...
     def append_url_change_rows(self, change_rows: list[dict]) -> int: ...
     def append_career_opening_rows(self, opening_rows: list[dict]) -> int: ...
+    def append_search_activity_rows(self, activity_rows: list[dict]) -> int: ...
     def update_job_status(self, job_apply_link: str,
                           new_status: str, notes: str = "") -> bool: ...
 
@@ -472,6 +474,61 @@ class NotificationManager:
         )
         return appended_openings > 0 or appended_changes > 0
 
+    def record_search_activity_in_sheet(self, activity_rows: list[dict[str, Any]]) -> bool:
+        """Persist per-URL monitor activity (searched/changed/ignored/error) for full audit history."""
+        if self._sheets is None or not activity_rows:
+            return False
+
+        payloads: list[dict[str, Any]] = []
+        for row in activity_rows:
+            if not isinstance(row, dict):
+                continue
+
+            url = str(row.get("url", "")).strip()
+            if not url:
+                continue
+
+            payloads.append(
+                {
+                    "timestamp": str(row.get("timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+                    "url": url,
+                    "domain": str(row.get("domain") or urlparse(url).netloc or ""),
+                    "status": str(row.get("status") or ""),
+                    "change_type": str(row.get("change_type") or ""),
+                    "total_openings": int(row.get("total_openings", 0) or 0),
+                    "new_openings_count": int(row.get("new_openings_count", 0) or 0),
+                    "scraper_used": str(row.get("scraper_used") or ""),
+                    "pages_visited": row.get("pages_visited") or 0,
+                    "error": str(row.get("error") or ""),
+                    "notes": str(row.get("notes") or ""),
+                }
+            )
+
+        if not payloads:
+            return False
+
+        appended = 0
+        append_batch_fn = getattr(self._sheets, "append_search_activity_rows", None)
+        if callable(append_batch_fn):
+            try:
+                appended = int(append_batch_fn(payloads))
+            except Exception as exc:
+                log.warning("Batch search activity append failed, falling back to single rows: %s", exc)
+
+        if appended == 0:
+            append_single_fn = getattr(self._sheets, "append_search_activity_row", None)
+            if callable(append_single_fn):
+                for payload in payloads:
+                    if bool(append_single_fn(payload)):
+                        appended += 1
+
+        if appended < len(payloads):
+            log.warning("Sheets search activity logging partial success: %d/%d", appended, len(payloads))
+        else:
+            log.info("Sheets search activity logging appended %d rows.", appended)
+
+        return appended > 0
+
     def update_job_in_sheet(
         self, apply_link: str, status: str, notes: str = "",
     ) -> bool:
@@ -494,11 +551,8 @@ class NotificationManager:
         """Test connectivity for all configured channels."""
         status: dict[str, bool | str] = {}
 
-        # Telegram
-        if self._tg and self._tg.bot_token and self._tg.chat_id:
-            status["telegram"] = True
-        else:
-            status["telegram"] = "not configured"
+        # Telegram channel is not wired in this manager variant.
+        status["telegram"] = "not configured"
 
         # Google Sheets
         if self._sheets is not None:

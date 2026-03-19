@@ -36,6 +36,8 @@
     "url_change_max_openings_per_event": 300,
     "url_change_max_openings_per_cycle": 5000,
     "url_change_log_baseline_openings": true,
+    "record_url_changes_to_sheets": true,
+    "record_search_activity_to_sheets": true,
     "url_monitor_async_concurrency": 4,
     "jsearch_async_concurrency": 1
 }

@@ -6,6 +6,33 @@ from github import Github, GithubException
 log = logging.getLogger(__name__)
 
 
+def _resolve_repo_relative_path(filepath: str) -> str:
+    """Return repository-relative POSIX path for GitHub Contents API."""
+    raw = (filepath or "").strip()
+    if not raw:
+        return "state.json"
+
+    normalized = os.path.normpath(raw)
+
+    # Prefer path relative to GITHUB_WORKSPACE when available.
+    workspace = os.environ.get("GITHUB_WORKSPACE", "").strip()
+    if workspace:
+        try:
+            rel = os.path.relpath(normalized, os.path.normpath(workspace))
+            if rel and not rel.startswith(".."):
+                normalized = rel
+        except Exception:
+            pass
+
+    # Fallback to basename when absolute/local path cannot be made relative.
+    if os.path.isabs(normalized):
+        normalized = os.path.basename(normalized)
+
+    # GitHub API requires forward slashes and no leading slash.
+    repo_path = normalized.replace("\\", "/").lstrip("/")
+    return repo_path or "state.json"
+
+
 class StateManager:
     def __init__(self, filepath: str = "state.json", max_notified_ids: int = 5000):
         self.filepath = filepath
@@ -206,6 +233,7 @@ class StateManager:
 
             gh = Github(gh_pat)
             repo = gh.get_repo(repo_name)
+            repo_path = _resolve_repo_relative_path(self.filepath)
 
             # Read current content
             with open(self.filepath, "r", encoding="utf-8") as f:
@@ -217,16 +245,15 @@ class StateManager:
 
             # Check if file exists in repo to get SHA
             try:
-                contents = repo.get_contents(self.filepath)
+                contents = repo.get_contents(repo_path)
                 repo.update_file(contents.path, commit_message,
                                  content, contents.sha)
-                log.info("Successfully updated state.json in GitHub via PyGithub")
+                log.info("Successfully updated %s in GitHub via PyGithub", repo_path)
             except GithubException as e:
                 if e.status == 404:
                     # File doesn't exist yet
-                    repo.create_file(self.filepath, commit_message, content)
-                    log.info(
-                        "Successfully created state.json in GitHub via PyGithub")
+                    repo.create_file(repo_path, commit_message, content)
+                    log.info("Successfully created %s in GitHub via PyGithub", repo_path)
                 else:
                     raise e
             return True
