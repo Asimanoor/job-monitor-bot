@@ -2,8 +2,8 @@ name: Job Page Monitor
 
 on:
   schedule:
-    # Run every 12 hours to preserve JSearch monthly quota
-    - cron: "0 */12 * * *"
+    # Run every 8 hours
+    - cron: "0 */8 * * *"
   workflow_dispatch: # Allow manual trigger from GitHub UI
 
 env:
@@ -12,9 +12,14 @@ env:
 permissions:
   contents: write # Needed to push state.json back
 
+concurrency:
+  group: job-monitor-8h
+  cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       # ── 1. Checkout the repo ───────────────────────────────────────────
@@ -32,6 +37,10 @@ jobs:
       # ── 3. Install dependencies ────────────────────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # ── 3.1 Install Playwright Chromium for JS-heavy career pages ─────
+      - name: Install Playwright browser
+        run: python -m playwright install --with-deps chromium
 
       # ── 4. Decode base64 Google credentials (if set) ───────────────────
       - name: Decode Google credentials
