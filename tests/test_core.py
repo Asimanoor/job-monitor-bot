@@ -2,6 +2,12 @@ from datetime import datetime, timezone
 
 from filter_engine import FilterEngine
 from groq_client import GroqClient
+from monitor import (
+    build_jsearch_query_plan,
+    extract_company_hints_from_urls,
+    run_repeating_pipeline,
+)
+from notification_manager import NotificationManager
 from state_manager import StateManager
 
 
@@ -11,6 +17,17 @@ def test_is_entry_level_with_junior_keyword():
     # include_keywords is ["junior"], exclude_keywords implicitly uses TITLE_EXCLUDE_WORDS and DESC_EXCLUDE_PATTERNS
     is_entry = engine.is_entry_level(
         "Junior Developer", "A great first job.", ["junior"], ["senior"])
+    assert is_entry is True
+
+
+def test_is_entry_level_with_title_hint_even_without_description_keyword():
+    engine = FilterEngine()
+    is_entry = engine.is_entry_level(
+        "Associate Software Engineer",
+        "Build backend APIs and internal tools.",
+        ["fresh", "junior", "entry level"],
+        ["senior", "lead"],
+    )
     assert is_entry is True
 
 
@@ -61,7 +78,8 @@ def test_fallback_chain():
     assert True
 
 
-def test_groq_client_fallback_classification_without_key():
+def test_groq_client_fallback_classification_without_key(monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
     client = GroqClient(api_key="")
     result = client.classify_job_level(
         "Junior Python Developer",
@@ -89,7 +107,7 @@ def test_filter_engine_excludes_when_ai_confidence_low():
     engine = FilterEngine(ai_client=DummyAI(), ai_confidence_threshold=70)
     raw = {
         "job_id": "abc-1",
-        "job_title": "Junior Software Engineer",
+        "job_title": "Software Engineer",
         "job_description": "Entry-level Python role for fresh graduates.",
         "job_posted_at_datetime_utc": datetime.now(timezone.utc).isoformat(),
         "job_apply_link": "https://example.com/job/abc-1",
@@ -100,3 +118,247 @@ def test_filter_engine_excludes_when_ai_confidence_low():
 
     job = engine.qualify_job(raw, ["Junior Software Engineer"], ["python"])
     assert job is None
+
+
+def test_filter_engine_keeps_title_hint_when_ai_confidence_low():
+    class DummyAI:
+        def classify_job_level(self, *_args, **_kwargs):
+            return {
+                "is_entry_level": True,
+                "confidence": 40,
+                "source": "ai",
+                "reason": "low confidence",
+            }
+
+        def score_job_match(self, *_args, **_kwargs):
+            return {"score": 70, "confidence": 80, "matched_skills": ["Python"], "source": "ai"}
+
+    engine = FilterEngine(ai_client=DummyAI(), ai_confidence_threshold=70)
+    raw = {
+        "job_id": "abc-2",
+        "job_title": "Associate Software Engineer",
+        "job_description": "Work on backend services and APIs.",
+        "job_posted_at_datetime_utc": datetime.now(timezone.utc).isoformat(),
+        "job_apply_link": "https://example.com/job/abc-2",
+        "employer_name": "ExampleCo",
+        "job_city": "Lahore",
+        "job_employment_type": "Full-time",
+    }
+
+    job = engine.qualify_job(raw, ["Associate Software Engineer"], ["python", "junior"])
+    assert job is not None
+
+
+def test_record_url_changes_in_sheet_writes_change_and_new_openings():
+    class DummySheets:
+        def __init__(self):
+            self.change_rows = []
+            self.opening_rows = []
+
+        def append_url_change_row(self, change_data: dict) -> bool:
+            self.change_rows.append(change_data)
+            return True
+
+        def append_career_opening_row(self, opening_data: dict) -> bool:
+            self.opening_rows.append(opening_data)
+            return True
+
+        # Legacy fallback compatibility
+        def append_job_row(self, _job_data: dict) -> bool:
+            return True
+
+    sheets = DummySheets()
+    manager = NotificationManager(sheets_client=sheets)
+
+    events = [
+        {
+            "url": "https://example.com/careers",
+            "domain": "example.com",
+            "change_type": "content_changed",
+            "page_title": "Example Careers",
+            "openings": [
+                {"title": "Junior Software Engineer", "link": "https://example.com/jobs/1"},
+                {"title": "Data Scientist", "link": "https://example.com/jobs/2"},
+            ],
+            "new_openings": [
+                {"title": "Junior Software Engineer", "link": "https://example.com/jobs/1"},
+            ],
+            "total_openings": 2,
+            "new_openings_count": 1,
+        }
+    ]
+
+    ok = manager.record_url_changes_in_sheet(events)
+
+    assert ok is True
+    assert len(sheets.change_rows) == 1
+    assert len(sheets.opening_rows) == 1
+    assert sheets.opening_rows[0]["position_title"] == "Junior Software Engineer"
+    assert sheets.opening_rows[0]["position_link"] == "https://example.com/jobs/1"
+
+
+def test_record_url_changes_in_sheet_logs_baseline_openings_for_new_url():
+    class DummySheets:
+        def __init__(self):
+            self.change_rows = []
+            self.opening_rows = []
+
+        def append_url_change_row(self, change_data: dict) -> bool:
+            self.change_rows.append(change_data)
+            return True
+
+        def append_career_opening_row(self, opening_data: dict) -> bool:
+            self.opening_rows.append(opening_data)
+            return True
+
+        def append_job_row(self, _job_data: dict) -> bool:
+            return True
+
+    sheets = DummySheets()
+    manager = NotificationManager(sheets_client=sheets)
+
+    events = [
+        {
+            "url": "https://company.test/careers",
+            "domain": "company.test",
+            "change_type": "new_url_tracked",
+            "page_title": "Company Careers",
+            "openings": [
+                {"title": "Associate AI Engineer", "link": "https://company.test/jobs/ai-associate"},
+                {"title": "Graduate Data Scientist", "link": "https://company.test/jobs/data-grad"},
+            ],
+            "new_openings": [],
+            "total_openings": 2,
+            "new_openings_count": 0,
+        }
+    ]
+
+    ok = manager.record_url_changes_in_sheet(events)
+
+    assert ok is True
+    assert len(sheets.change_rows) == 1
+    assert len(sheets.opening_rows) == 2
+
+
+def test_record_url_changes_in_sheet_appends_primary_rows_with_links_tag():
+    class DummySheets:
+        def __init__(self):
+            self.change_rows = []
+            self.opening_rows = []
+            self.primary_rows = []
+
+        def append_url_change_row(self, change_data: dict) -> bool:
+            self.change_rows.append(change_data)
+            return True
+
+        def append_career_opening_row(self, opening_data: dict) -> bool:
+            self.opening_rows.append(opening_data)
+            return True
+
+        def append_job_row(self, job_data: dict) -> bool:
+            self.primary_rows.append(job_data)
+            return True
+
+    sheets = DummySheets()
+    manager = NotificationManager(sheets_client=sheets)
+
+    events = [
+        {
+            "url": "https://acme.test/careers",
+            "resolved_url": "https://acme.test/careers",
+            "domain": "acme.test",
+            "change_type": "content_changed",
+            "page_title": "Acme Careers",
+            "openings": [
+                {"title": "Junior Platform Engineer", "link": "https://acme.test/jobs/plat-1"},
+            ],
+            "new_openings": [
+                {"title": "Junior Platform Engineer", "link": "https://acme.test/jobs/plat-1"},
+            ],
+            "total_openings": 1,
+            "new_openings_count": 1,
+            "scraper_used": "playwright",
+        }
+    ]
+
+    ok = manager.record_url_changes_in_sheet(events)
+
+    assert ok is True
+    assert len(sheets.change_rows) == 1
+    assert len(sheets.opening_rows) == 1
+    assert len(sheets.primary_rows) == 1
+    assert sheets.primary_rows[0]["matched_keywords"] == "LINKS_TXT_CHANGE"
+    assert sheets.primary_rows[0]["status"] == "Changed Opening"
+    assert "Source: links.txt" in sheets.primary_rows[0]["notes"]
+
+
+def test_run_repeating_pipeline_respects_max_cycles():
+    calls: list[int] = []
+    sleeps: list[float] = []
+
+    total = run_repeating_pipeline(
+        lambda cycle: calls.append(cycle),
+        interval_seconds=1.0,
+        max_cycles=3,
+        sleep_fn=lambda seconds: sleeps.append(seconds),
+    )
+
+    assert total == 3
+    assert calls == [1, 2, 3]
+    assert len(sleeps) == 2
+
+
+def test_run_repeating_pipeline_single_cycle_when_interval_zero():
+    calls: list[int] = []
+
+    total = run_repeating_pipeline(
+        lambda cycle: calls.append(cycle),
+        interval_seconds=0,
+        max_cycles=0,
+        sleep_fn=lambda _seconds: None,
+    )
+
+    assert total == 1
+    assert calls == [1]
+
+
+def test_extract_company_hints_from_urls_handles_ats_patterns_and_query_params():
+    urls = [
+        "https://jobs.lever.co/educative",
+        "https://apply.workable.com/devsinc-17/",
+        "https://jobs.ashbyhq.com/tajir",
+        "https://strategic-systems-international.breezy.hr/",
+        "https://career55.sapsf.eu/career?company=systemvent",
+        "https://www.gomotive.com/careers",
+    ]
+
+    hints = extract_company_hints_from_urls(urls, max_companies=20)
+
+    assert "educative" in hints
+    assert "devsinc 17" in hints
+    assert "tajir" in hints
+    assert "strategic systems international" in hints
+    assert "systemvent" in hints
+    assert "gomotive" in hints
+
+
+def test_build_jsearch_query_plan_prioritizes_company_targeted_then_generic():
+    titles = ["Junior Software Engineer", "Associate Data Scientist"]
+    locations = ["Pakistan", "Remote"]
+    companies = ["educative", "tajir"]
+
+    plan = build_jsearch_query_plan(
+        titles=titles,
+        locations=locations,
+        company_hints=companies,
+        allowed_queries=5,
+        company_targeted_enabled=True,
+        company_max_queries=2,
+    )
+
+    assert len(plan) == 5
+    assert plan[0]["source"] == "JSEARCH_COMPANY_TARGETED"
+    assert plan[1]["source"] == "JSEARCH_COMPANY_TARGETED"
+    assert plan[2]["source"] == "JSEARCH_API"
+    assert plan[0]["company"] == "educative"
+    assert plan[1]["company"] == "tajir"
