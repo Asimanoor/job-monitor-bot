@@ -193,8 +193,9 @@ def test_record_url_changes_in_sheet_writes_change_and_new_openings():
     assert ok is True
     assert len(sheets.change_rows) == 1
     assert len(sheets.opening_rows) == 1
-    assert sheets.opening_rows[0]["position_title"] == "Junior Software Engineer"
-    assert sheets.opening_rows[0]["position_link"] == "https://example.com/jobs/1"
+    assert sheets.opening_rows[0]["job_title"] == "Junior Software Engineer"
+    assert sheets.opening_rows[0]["apply_link"] == "https://example.com/jobs/1"
+    assert sheets.opening_rows[0]["status"] == "New"
 
 
 def test_record_url_changes_in_sheet_logs_baseline_openings_for_new_url():
@@ -240,7 +241,7 @@ def test_record_url_changes_in_sheet_logs_baseline_openings_for_new_url():
     assert len(sheets.opening_rows) == 2
 
 
-def test_record_url_changes_in_sheet_appends_primary_rows_with_links_tag():
+def test_record_url_changes_in_sheet_does_not_append_primary_rows_with_links_tag():
     class DummySheets:
         def __init__(self):
             self.change_rows = []
@@ -286,10 +287,7 @@ def test_record_url_changes_in_sheet_appends_primary_rows_with_links_tag():
     assert ok is True
     assert len(sheets.change_rows) == 1
     assert len(sheets.opening_rows) == 1
-    assert len(sheets.primary_rows) == 1
-    assert sheets.primary_rows[0]["matched_keywords"] == "LINKS_TXT_CHANGE"
-    assert sheets.primary_rows[0]["status"] == "Changed Opening"
-    assert "Source: links.txt" in sheets.primary_rows[0]["notes"]
+    assert len(sheets.primary_rows) == 0
 
 
 def test_run_repeating_pipeline_respects_max_cycles():
