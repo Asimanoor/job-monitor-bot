@@ -5,6 +5,7 @@ Main orchestrator script connecting config, API, filtering, and notifications.
 """
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -17,6 +18,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from job_scraper import extract_job_postings, is_valid_job_posting
 
 from config_loader import ConfigLoader
 from filter_engine import FilterEngine
@@ -284,6 +286,9 @@ def _extract_openings_from_jsonld(base_url: str, soup: BeautifulSoup, max_positi
             if link:
                 link = urljoin(base_url, link)
 
+            if not is_valid_job_posting({"title": title, "apply_link": link, "job_url": link}):
+                continue
+
             item = {"title": title, "link": link or base_url}
             fp = _opening_fingerprint(item)
             if fp in seen:
@@ -306,6 +311,23 @@ def _extract_openings_from_html(base_url: str, html: str, max_positions: int = 5
     openings: list[dict[str, str]] = []
     seen: set[str] = set()
 
+    strict_jobs = extract_job_postings(html, base_url, max_results=max_positions)
+    for job in strict_jobs:
+        item = {
+            "title": _normalize_whitespace(str(job.get("title") or "")),
+            "link": str(job.get("apply_link") or job.get("job_url") or "").strip(),
+        }
+        if not item["title"] or not item["link"]:
+            continue
+        fp = _opening_fingerprint(item)
+        if fp in seen:
+            continue
+        seen.add(fp)
+        openings.append(item)
+
+        if len(openings) >= max_positions:
+            return page_title, openings
+
     # Prefer structured data first when present.
     for item in _extract_openings_from_jsonld(base_url, soup, max_positions=max_positions):
         fp = _opening_fingerprint(item)
@@ -316,31 +338,6 @@ def _extract_openings_from_html(base_url: str, html: str, max_positions: int = 5
 
         if len(openings) >= max_positions:
             return page_title, openings
-
-    for anchor in soup.find_all("a", href=True):
-        title = _normalize_whitespace(anchor.get_text(" ", strip=True))
-        if not _looks_like_opening_title(title):
-            continue
-
-        href = (anchor.get("href") or "").strip()
-        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            continue
-
-        absolute_link = urljoin(base_url, href)
-        parsed = urlparse(absolute_link)
-        if parsed.scheme not in {"http", "https"}:
-            continue
-
-        item = {"title": title, "link": absolute_link}
-        fp = _opening_fingerprint(item)
-        if fp in seen:
-            continue
-
-        seen.add(fp)
-        openings.append(item)
-
-        if len(openings) >= max_positions:
-            break
 
     return page_title, openings
 
@@ -358,11 +355,210 @@ def _as_bool(value: object, default: bool = False) -> bool:
     return default
 
 
+def _run_async(coro):
+    """Run async coroutines safely from sync entry-points."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
+def _monitor_single_url_sync(
+    url: str,
+    old_hash: str | None,
+    previous_fingerprints: set[str],
+    scraper: object | None,
+    max_pages_per_site: int,
+    max_openings_per_page: int,
+    headers: dict[str, str],
+) -> dict[str, object]:
+    """Process one URL and return normalized monitoring outcome."""
+    try:
+        page_html = ""
+        resolved_url = url
+        new_hash = ""
+        scraper_used = "requests"
+        scraper_error = ""
+        scraped_openings: list[dict[str, str]] = []
+        scraped_page_title = ""
+        pages_visited: list[str] = []
+
+        if scraper is not None and hasattr(scraper, "scrape_site_openings_sync"):
+            try:
+                site_result = scraper.scrape_site_openings_sync(
+                    url,
+                    max_pages=max(1, int(max_pages_per_site)),
+                    max_openings=max(1, int(max_openings_per_page)),
+                )
+
+                if isinstance(site_result, dict) and site_result.get("ok"):
+                    resolved_url = str(site_result.get("final_url") or url)
+                    scraper_used = str(site_result.get("scraper") or "multi_strategy")
+                    scraped_page_title = str(site_result.get("page_title") or "")
+                    pages_visited = [
+                        str(page_url)
+                        for page_url in (site_result.get("pages_visited") or [])
+                        if str(page_url).strip()
+                    ]
+                    scraped_openings = [
+                        item for item in (site_result.get("openings") or []) if isinstance(item, dict)
+                    ]
+
+                    hash_payload = json.dumps(
+                        {
+                            "resolved_url": resolved_url,
+                            "pages_visited": pages_visited,
+                            "openings": scraped_openings,
+                            "page_title": scraped_page_title,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    new_hash = hashlib.sha256(hash_payload.encode("utf-8", errors="ignore")).hexdigest()
+                else:
+                    scraper_error = str(
+                        (site_result or {}).get("error")
+                        if isinstance(site_result, dict)
+                        else "unknown scrape_site_openings_sync error"
+                    )
+            except Exception as exc:
+                scraper_error = str(exc)
+
+        if scraper is not None and hasattr(scraper, "scrape_job_sync") and not new_hash:
+            try:
+                scraped = scraper.scrape_job_sync(url)
+                if isinstance(scraped, dict) and scraped.get("ok") and scraped.get("html"):
+                    page_html = str(scraped.get("html") or "")
+                    resolved_url = str(scraped.get("final_url") or url)
+                    new_hash = hashlib.sha256(page_html.encode("utf-8", errors="ignore")).hexdigest()
+                    scraper_used = str(scraped.get("scraper") or "playwright")
+                else:
+                    scraper_error = str((scraped or {}).get("error") if isinstance(scraped, dict) else "unknown error")
+            except Exception as exc:
+                scraper_error = str(exc)
+
+        if not new_hash:
+            resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+            page_html = resp.text or ""
+            resolved_url = str(resp.url or url)
+            new_hash = hashlib.sha256(resp.content).hexdigest()
+            scraper_used = "requests"
+
+        if old_hash is not None and new_hash == old_hash:
+            return {
+                "url": url,
+                "new_hash": new_hash,
+                "status": "unchanged",
+                "new_fingerprints": list(previous_fingerprints),
+            }
+
+        change_type = "new_url_tracked" if old_hash is None else "content_changed"
+        if scraped_openings:
+            page_title = scraped_page_title
+            openings = scraped_openings
+        else:
+            page_title, openings = _extract_openings_from_html(
+                resolved_url,
+                page_html,
+                max_positions=max(1, int(max_openings_per_page)),
+            )
+
+        if not openings:
+            return {
+                "url": url,
+                "new_hash": new_hash,
+                "status": "ignored_no_jobs",
+                "new_fingerprints": [],
+                "scraper_error": scraper_error,
+            }
+
+        current_fingerprints = {_opening_fingerprint(o) for o in openings}
+        new_openings = [o for o in openings if _opening_fingerprint(o) not in previous_fingerprints]
+
+        if change_type == "content_changed" and not new_openings:
+            return {
+                "url": url,
+                "new_hash": new_hash,
+                "status": "no_new_openings",
+                "new_fingerprints": list(current_fingerprints),
+            }
+
+        event = {
+            "url": url,
+            "resolved_url": resolved_url,
+            "domain": urlparse(url).netloc,
+            "change_type": change_type,
+            "page_title": page_title,
+            "openings": openings,
+            "new_openings": new_openings,
+            "total_openings": len(openings),
+            "new_openings_count": len(new_openings),
+            "old_hash": old_hash or "",
+            "new_hash": new_hash,
+            "source": "links.txt",
+            "scraper_used": scraper_used,
+            "pages_visited": pages_visited,
+        }
+
+        return {
+            "url": url,
+            "new_hash": new_hash,
+            "status": change_type,
+            "event": event,
+            "new_fingerprints": list(current_fingerprints),
+        }
+    except requests.RequestException as exc:
+        return {"url": url, "status": "error", "error": f"Request error — {exc}"}
+    except Exception as exc:
+        return {"url": url, "status": "error", "error": f"Unexpected monitor error — {exc}"}
+
+
+async def _monitor_urls_async(
+    urls: list[str],
+    old_hashes: dict[str, str | None],
+    opening_fingerprints: dict[str, set[str]],
+    scraper: object | None,
+    max_pages_per_site: int,
+    max_openings_per_page: int,
+    concurrency: int,
+) -> list[dict[str, object]]:
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    async def _worker(target_url: str) -> dict[str, object]:
+        async with sem:
+            return await asyncio.to_thread(
+                _monitor_single_url_sync,
+                target_url,
+                old_hashes.get(target_url),
+                opening_fingerprints.get(target_url, set()),
+                scraper,
+                max_pages_per_site,
+                max_openings_per_page,
+                headers,
+            )
+
+    return await asyncio.gather(*[_worker(url) for url in urls])
+
+
 def monitor_urls(
     state_mgr: StateManager,
     scraper: object | None = None,
     max_pages_per_site: int = 6,
     max_openings_per_page: int = 50,
+    concurrency: int = 4,
 ) -> list[dict[str, object]]:
     """Check URLs from links.txt for content changes and extract opening details."""
     urls = ConfigLoader.load_urls(LINKS_FILE)
@@ -373,157 +569,66 @@ def monitor_urls(
     change_events: list[dict[str, object]] = []
     errors = []
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+    old_hashes = {url: state_mgr.get_url_hash(url) for url in urls}
+    opening_fingerprints = {
+        url: state_mgr.get_url_opening_fingerprints(url)
+        for url in urls
     }
 
-    with requests.Session() as session:
-        for url in urls:
-            try:
-                page_html = ""
-                resolved_url = url
-                new_hash = ""
-                scraper_used = "requests"
-                scraper_error = ""
-                scraped_openings: list[dict[str, str]] = []
-                scraped_page_title = ""
-                pages_visited: list[str] = []
+    results = _run_async(
+        _monitor_urls_async(
+            urls=urls,
+            old_hashes=old_hashes,
+            opening_fingerprints=opening_fingerprints,
+            scraper=scraper,
+            max_pages_per_site=max_pages_per_site,
+            max_openings_per_page=max_openings_per_page,
+            concurrency=concurrency,
+        )
+    )
 
-                # Prefer full-site (pagination-aware) scraping when available.
-                if scraper is not None and hasattr(scraper, "scrape_site_openings_sync"):
-                    try:
-                        site_result = scraper.scrape_site_openings_sync(
-                            url,
-                            max_pages=max(1, int(max_pages_per_site)),
-                            max_openings=max(1, int(max_openings_per_page)),
-                        )
+    for result in results:
+        target_url = str(result.get("url", ""))
+        status = str(result.get("status", "error"))
 
-                        if isinstance(site_result, dict) and site_result.get("ok"):
-                            resolved_url = str(site_result.get("final_url") or url)
-                            scraper_used = str(site_result.get("scraper") or "multi_strategy")
-                            scraped_page_title = str(site_result.get("page_title") or "")
-                            pages_visited = [
-                                str(page_url) for page_url in (site_result.get("pages_visited") or []) if str(page_url).strip()
-                            ]
-                            scraped_openings = [
-                                item for item in (site_result.get("openings") or [])
-                                if isinstance(item, dict)
-                            ]
+        if status == "error":
+            log.error("%s: %s", target_url, result.get("error", "unknown error"))
+            errors.append(target_url)
+            continue
 
-                            # Change detection key based on extracted openings + visited pages.
-                            hash_payload = json.dumps(
-                                {
-                                    "resolved_url": resolved_url,
-                                    "pages_visited": pages_visited,
-                                    "openings": scraped_openings,
-                                    "page_title": scraped_page_title,
-                                },
-                                ensure_ascii=False,
-                                sort_keys=True,
-                            )
-                            new_hash = hashlib.sha256(hash_payload.encode("utf-8", errors="ignore")).hexdigest()
-                        else:
-                            scraper_error = str((site_result or {}).get("error") if isinstance(site_result, dict) else "unknown scrape_site_openings_sync error")
-                    except Exception as exc:
-                        scraper_error = str(exc)
+        if status == "unchanged":
+            log.info("✅  No change:       %s", target_url)
+        elif status == "ignored_no_jobs":
+            log.info("⚪  Ignored change (no valid job postings): %s", target_url)
+        elif status == "no_new_openings":
+            log.info("✅  No new openings:  %s", target_url)
+        elif status == "new_url_tracked":
+            event = result.get("event") if isinstance(result.get("event"), dict) else {}
+            log.info(
+                "🆕  New URL tracked: %s (openings detected: %d)",
+                target_url,
+                int(event.get("total_openings", 0) or 0),
+            )
+        elif status == "content_changed":
+            event = result.get("event") if isinstance(result.get("event"), dict) else {}
+            log.info(
+                "🔄  Change detected: %s (openings: %d, new openings: %d)",
+                target_url,
+                int(event.get("total_openings", 0) or 0),
+                int(event.get("new_openings_count", 0) or 0),
+            )
 
-                if scraper is not None and hasattr(scraper, "scrape_job_sync"):
-                    if not new_hash:
-                        try:
-                            scraped = scraper.scrape_job_sync(url)
-                            if isinstance(scraped, dict) and scraped.get("ok") and scraped.get("html"):
-                                page_html = str(scraped.get("html") or "")
-                                resolved_url = str(scraped.get("final_url") or url)
-                                new_hash = hashlib.sha256(page_html.encode("utf-8", errors="ignore")).hexdigest()
-                                scraper_used = str(scraped.get("scraper") or "playwright")
-                            else:
-                                scraper_error = str((scraped or {}).get("error") if isinstance(scraped, dict) else "unknown error")
-                        except Exception as exc:
-                            scraper_error = str(exc)
+        new_hash = str(result.get("new_hash", "")).strip()
+        if new_hash:
+            state_mgr.set_url_hash(target_url, new_hash)
 
-                if not new_hash:
-                    if scraper_error:
-                        log.warning("Preferred scraper failed for %s (%s). Falling back to requests.", url, scraper_error)
+        new_fps = result.get("new_fingerprints", [])
+        if isinstance(new_fps, list):
+            state_mgr.set_url_opening_fingerprints(target_url, new_fps)
 
-                    resp = session.get(url, headers=headers,
-                                       timeout=15, allow_redirects=True)
-                    resp.raise_for_status()
-                    page_html = resp.text or ""
-                    resolved_url = str(resp.url or url)
-                    new_hash = hashlib.sha256(resp.content).hexdigest()
-                    scraper_used = "requests"
-
-                old_hash = state_mgr.get_url_hash(url)
-                change_type = ""
-                if old_hash is None:
-                    change_type = "new_url_tracked"
-                elif new_hash != old_hash:
-                    change_type = "content_changed"
-                else:
-                    log.info("✅  No change:       %s", url)
-
-                if change_type:
-                    if scraped_openings:
-                        page_title = scraped_page_title
-                        openings = scraped_openings
-                    else:
-                        page_title, openings = _extract_openings_from_html(
-                            resolved_url,
-                            page_html,
-                            max_positions=max(1, int(max_openings_per_page)),
-                        )
-
-                    previous_fingerprints = state_mgr.get_url_opening_fingerprints(url)
-                    current_fingerprints = {_opening_fingerprint(o) for o in openings}
-                    new_openings = [o for o in openings if _opening_fingerprint(o) not in previous_fingerprints]
-
-                    state_mgr.set_url_opening_fingerprints(url, list(current_fingerprints))
-
-                    if change_type == "new_url_tracked":
-                        log.info(
-                            "🆕  New URL tracked: %s (openings detected: %d)",
-                            url,
-                            len(openings),
-                        )
-                    else:
-                        log.info(
-                            "🔄  Change detected: %s (openings: %d, new openings: %d)",
-                            url,
-                            len(openings),
-                            len(new_openings),
-                        )
-
-                    change_events.append(
-                        {
-                            "url": url,
-                            "resolved_url": resolved_url,
-                            "domain": urlparse(url).netloc,
-                            "change_type": change_type,
-                            "page_title": page_title,
-                            "openings": openings,
-                            "new_openings": new_openings,
-                            "total_openings": len(openings),
-                            "new_openings_count": len(new_openings),
-                            "old_hash": old_hash or "",
-                            "new_hash": new_hash,
-                            "source": "links.txt",
-                            "scraper_used": scraper_used,
-                            "pages_visited": pages_visited,
-                        }
-                    )
-
-                state_mgr.set_url_hash(url, new_hash)
-            except requests.RequestException as exc:
-                log.error("Request error for %s — %s", url, exc)
-                errors.append(url)
-            except Exception as exc:
-                log.error("Unexpected monitor error for %s — %s", url, exc)
-                errors.append(url)
+        event = result.get("event")
+        if isinstance(event, dict):
+            change_events.append(event)
 
     print("\n" + "=" * 60)
     print("  URL MONITORING SUMMARY")
@@ -532,6 +637,107 @@ def monitor_urls(
     print(f"  Errors   : {len(errors)}")
     print("=" * 60 + "\n")
     return change_events
+
+
+async def _execute_jsearch_plan_async(
+    jsearch: JSearchClient,
+    query_plan: list[dict[str, str]],
+    concurrency: int,
+) -> list[dict[str, object]]:
+    """Execute JSearch query plan concurrently and return ordered results."""
+    if not query_plan:
+        return []
+
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _worker(task: dict[str, str]) -> dict[str, object]:
+        query_text = str(task.get("query") or "").strip()
+        location_text = str(task.get("location") or "").strip()
+        shown_query = f"{query_text} in {location_text}" if location_text else query_text
+
+        if not query_text:
+            return {"task": task, "raw_results": [], "shown_query": shown_query}
+
+        async with sem:
+            log.info("🔍  Searching: %s", shown_query)
+            try:
+                raw_results = await asyncio.to_thread(jsearch.search_jobs, query_text, location_text)
+            except Exception as exc:
+                log.warning("JSearch async worker failed for '%s': %s", shown_query, exc)
+                raw_results = []
+
+        return {
+            "task": task,
+            "raw_results": raw_results if isinstance(raw_results, list) else [],
+            "shown_query": shown_query,
+        }
+
+    return await asyncio.gather(*[_worker(task) for task in query_plan])
+
+
+async def _run_sources_async(
+    state_mgr: StateManager,
+    scraper: object | None,
+    max_pages_per_site: int,
+    max_openings_per_page: int,
+    monitor_concurrency: int,
+    jsearch: JSearchClient,
+    query_plan: list[dict[str, str]],
+    jsearch_concurrency: int,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Run links.txt monitoring and JSearch queries concurrently."""
+    monitor_task = asyncio.to_thread(
+        monitor_urls,
+        state_mgr,
+        scraper,
+        max_pages_per_site,
+        max_openings_per_page,
+        monitor_concurrency,
+    )
+    jsearch_task = _execute_jsearch_plan_async(
+        jsearch=jsearch,
+        query_plan=query_plan,
+        concurrency=jsearch_concurrency,
+    )
+
+    monitor_result, jsearch_result = await asyncio.gather(
+        monitor_task,
+        jsearch_task,
+        return_exceptions=True,
+    )
+
+    url_change_events: list[dict[str, object]] = []
+    query_results: list[dict[str, object]] = []
+
+    if isinstance(monitor_result, Exception):
+        log.error("URL monitoring crashed: %s", monitor_result)
+    elif isinstance(monitor_result, list):
+        url_change_events = monitor_result
+
+    if isinstance(jsearch_result, Exception):
+        log.error("JSearch async execution crashed: %s", jsearch_result)
+    elif isinstance(jsearch_result, list):
+        query_results = jsearch_result
+
+    return url_change_events, query_results
+
+
+async def _notify_url_changes_async(
+    notifier: object,
+    url_change_events: list[dict[str, object]],
+) -> None:
+    """Send URL-change alert and record rows concurrently."""
+    if not url_change_events:
+        return
+
+    tasks = [
+        asyncio.to_thread(notifier.send_url_change_alert, url_change_events),
+        asyncio.to_thread(notifier.record_url_changes_in_sheet, url_change_events),
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            log.error("URL change notification sub-task failed: %s", result)
 
 
 def _decode_base64_creds() -> str:
@@ -690,25 +896,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 log.info("Health %s: %s", ch, status)
         return
 
-    # 4. Monitor URLs (links.txt) using Playwright first, then requests fallback.
-    try:
-        url_change_events = monitor_urls(
-            state_mgr,
-            scraper=career_scraper,
-            max_pages_per_site=int(config.get("link_scraper_max_pages", 8)),
-            max_openings_per_page=int(
-                config.get(
-                    "link_scraper_max_openings_per_site",
-                    config.get("playwright_max_openings_per_page", 80),
-                )
-            ),
-        )
-        state_mgr.save_state()
-    except Exception as exc:
-        log.error("URL monitoring crashed: %s", exc)
-        url_change_events = []
-
-    # 5. Search jobs from jobs.txt using JSearch API
+    # 4. Prepare search inputs and API query budget
     titles = ConfigLoader.load_job_titles(JOBS_FILE)
     filters = ConfigLoader.load_filters(FILTERS_FILE)
     locations = config.get("search_locations")
@@ -750,9 +938,6 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
 
     all_qualified_jobs = []
 
-    # Add an inter-query delay as a defensive practice.
-    rate_limit_delay = 1
-
     query_plan = build_jsearch_query_plan(
         titles=titles,
         locations=locations if isinstance(locations, list) else [],
@@ -762,21 +947,39 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         company_max_queries=int(config.get("company_targeted_max_queries_per_run", 4)),
     )
 
+    # 5. Run links.txt scraping + JSearch API side-by-side
+    url_change_events, query_results = _run_async(
+        _run_sources_async(
+            state_mgr=state_mgr,
+            scraper=career_scraper,
+            max_pages_per_site=int(config.get("link_scraper_max_pages", 8)),
+            max_openings_per_page=int(
+                config.get(
+                    "link_scraper_max_openings_per_site",
+                    config.get("playwright_max_openings_per_page", 80),
+                )
+            ),
+            monitor_concurrency=max(1, int(config.get("url_monitor_async_concurrency", 4))),
+            jsearch=jsearch,
+            query_plan=query_plan,
+            jsearch_concurrency=max(1, int(config.get("jsearch_async_concurrency", 2))),
+        )
+    )
+    state_mgr.save_state()
+
     queries_used = 0
     company_query_count = 0
     generic_query_count = 0
 
-    for task in query_plan:
+    for query_result in query_results:
+        task = query_result.get("task") if isinstance(query_result.get("task"), dict) else {}
         query_text = str(task.get("query") or "").strip()
-        location_text = str(task.get("location") or "").strip()
-        source_tag = str(task.get("source") or "JSEARCH_API")
-        target_company = str(task.get("company") or "").strip()
-
         if not query_text:
             continue
 
-        shown_query = f"{query_text} in {location_text}" if location_text else query_text
-        log.info("🔍  Searching: %s", shown_query)
+        source_tag = str(task.get("source") or "JSEARCH_API")
+        target_company = str(task.get("company") or "").strip()
+        raw_results = query_result.get("raw_results") if isinstance(query_result.get("raw_results"), list) else []
 
         state_mgr.track_api_usage()
         queries_used += 1
@@ -785,8 +988,6 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
             company_query_count += 1
         else:
             generic_query_count += 1
-
-        raw_results = jsearch.search_jobs(query_text, location_text)
 
         for raw in raw_results:
             job = filter_engine.qualify_job(raw, titles, filters)
@@ -806,8 +1007,6 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 job["source"] = "JSEARCH_API"
 
             all_qualified_jobs.append(job)
-
-        time.sleep(rate_limit_delay)
 
     if query_plan:
         log.info(
@@ -842,8 +1041,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         elif notifier is not None:
             try:
                 if url_change_events:
-                    notifier.send_url_change_alert(url_change_events)
-                    notifier.record_url_changes_in_sheet(url_change_events)
+                    _run_async(_notify_url_changes_async(notifier, url_change_events))
                 if new_jobs:
                     notifier.notify_new_jobs(new_jobs)
             except Exception as exc:

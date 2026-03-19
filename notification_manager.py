@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from job_scraper import is_valid_job_posting
 from telegram_bot import TelegramBot
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,8 @@ class SheetsClient(Protocol):
     def append_job_row(self, job_data: dict) -> bool: ...
     def append_url_change_row(self, change_data: dict) -> bool: ...
     def append_career_opening_row(self, opening_data: dict) -> bool: ...
+    def append_url_change_rows(self, change_rows: list[dict]) -> int: ...
+    def append_career_opening_rows(self, opening_rows: list[dict]) -> int: ...
     def update_job_status(self, job_apply_link: str,
                           new_status: str, notes: str = "") -> bool: ...
 
@@ -316,14 +319,13 @@ class NotificationManager:
         return False
 
     def record_url_changes_in_sheet(self, changed_urls: list[Any]) -> bool:
-        """Persist URL page-change events and detected openings to Sheets."""
+        """Persist validated job openings extracted from monitored career URLs."""
         events = self._normalize_url_change_events(changed_urls)
         if not events or self._sheets is None:
             return False
 
-        appended_changes = 0
-        appended_openings = 0
-        appended_primary_rows = 0
+        change_payloads: list[dict[str, Any]] = []
+        opening_payloads: list[dict[str, Any]] = []
 
         for event in events:
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -332,172 +334,112 @@ class NotificationManager:
             page_title = str(event.get("page_title", ""))
             change_type = str(event.get("change_type", "content_changed"))
             scraper_used = str(event.get("scraper_used") or "unknown")
-            resolved_url = str(event.get("resolved_url") or "")
 
             new_openings = event.get("new_openings") if isinstance(event.get("new_openings"), list) else []
             all_openings = event.get("openings") if isinstance(event.get("openings"), list) else []
             total_openings = int(event.get("total_openings", len(all_openings)) or 0)
             new_openings_count = int(event.get("new_openings_count", len(new_openings)) or 0)
 
-            preview_titles = [
-                str(opening.get("title", "")).strip()
-                for opening in new_openings[:5]
-                if isinstance(opening, dict) and str(opening.get("title", "")).strip()
-            ]
-
-            change_payload = {
-                "timestamp": now,
-                "url": url,
-                "domain": domain,
-                "change_type": change_type,
-                "page_title": page_title,
-                "total_openings": total_openings,
-                "new_openings_count": new_openings_count,
-                "new_opening_titles_preview": preview_titles,
-                "notes": f"Automated career-page hash change monitor (source=links.txt, scraper={scraper_used})",
-            }
-
-            wrote_change = False
-            append_url_change_fn = getattr(self._sheets, "append_url_change_row", None)
-            if callable(append_url_change_fn):
-                wrote_change = bool(append_url_change_fn(change_payload))
-            else:
-                fallback_row = {
+            change_payloads.append(
+                {
                     "timestamp": now,
-                    "job_title": "[URL Change Detected] Careers page updated",
-                    "company": domain,
-                    "location": "",
-                    "job_type": "",
-                    "posted_date": now[:10],
-                    "apply_link": url,
-                    "description": f"Change type: {change_type}. New openings: {new_openings_count}. Total detected: {total_openings}.",
-                    "matched_keywords": "URL_MONITOR",
-                    "status": "URL Changed",
-                    "notes": ", ".join(preview_titles)[:300],
-                    "ai_score": "",
+                    "url": url,
+                    "domain": domain,
+                    "change_type": change_type,
+                    "page_title": page_title,
+                    "total_openings": total_openings,
+                    "new_openings_count": new_openings_count,
+                    "new_opening_titles_preview": [
+                        str(opening.get("title", "")).strip()
+                        for opening in new_openings[:5]
+                        if isinstance(opening, dict)
+                    ],
+                    "notes": f"Job-only monitor (source=links.txt, scraper={scraper_used})",
                 }
-                wrote_change = self._sheets.append_job_row(fallback_row)
-
-            if wrote_change:
-                appended_changes += 1
+            )
 
             openings_to_log = new_openings if new_openings else (all_openings if change_type == "new_url_tracked" else [])
-            append_opening_fn = getattr(self._sheets, "append_career_opening_row", None)
-            append_primary_fn = getattr(self._sheets, "append_job_row", None)
 
-            # If no concrete opening is extractable, still append a summary change row in the primary sheet.
-            if not openings_to_log and callable(append_primary_fn) and callable(append_url_change_fn):
-                summary_ok = bool(
-                    append_primary_fn(
-                        {
-                            "timestamp": now,
-                            "job_title": "[LINKS.TXT CHANGE] Career page changed",
-                            "company": domain,
-                            "location": "",
-                            "job_type": "Career Page Monitor",
-                            "posted_date": now[:10],
-                            "apply_link": resolved_url or url,
-                            "description": f"Career page changed. Source URL: {url}. Change type: {change_type}. Openings detected: {total_openings}.",
-                            "matched_keywords": "LINKS_TXT_CHANGE",
-                            "status": "URL Changed",
-                            "notes": f"Source: links.txt | Career URL: {url} | Scraper: {scraper_used} | Page title: {page_title[:120]}",
-                            "ai_score": "",
-                        }
-                    )
-                )
-                if summary_ok:
-                    appended_primary_rows += 1
-
+            seen_tokens: set[str] = set()
             for opening in openings_to_log:
                 if not isinstance(opening, dict):
                     continue
 
                 opening_title = str(opening.get("title", "")).strip()
-                opening_link = str(opening.get("link", "")).strip() or url
-                if not opening_title:
+                opening_link = str(opening.get("link", "")).strip()
+                job_payload = {
+                    "title": opening_title,
+                    "company": domain,
+                    "location": str(opening.get("location", "")).strip(),
+                    "type": str(opening.get("type", "")).strip(),
+                    "apply_link": opening_link,
+                    "posted_date": str(opening.get("posted_date", "")).strip(),
+                    "source_url": url,
+                    "job_url": opening_link,
+                }
+
+                if not is_valid_job_posting(job_payload):
                     continue
 
-                wrote_opening = False
-                if callable(append_opening_fn):
-                    wrote_opening = bool(
-                        append_opening_fn(
-                            {
-                                "timestamp": now,
-                                "source_url": url,
-                                "domain": domain,
-                                "position_title": opening_title,
-                                "position_link": opening_link,
-                                "change_type": change_type,
-                                "page_title": page_title,
-                                "is_new": opening in new_openings,
-                                "notes": f"Detected from careers page content (source=links.txt, scraper={scraper_used})",
-                            }
-                        )
-                    )
-                else:
-                    wrote_opening = self._sheets.append_job_row(
-                        {
-                            "timestamp": now,
-                            "job_title": opening_title,
-                            "company": domain,
-                            "location": "",
-                            "job_type": "",
-                            "posted_date": now[:10],
-                            "apply_link": opening_link,
-                            "description": f"Detected from changed careers page: {url}",
-                            "matched_keywords": "URL_OPENING",
-                            "status": "Opening Detected",
-                            "notes": page_title[:250],
-                            "ai_score": "",
-                        }
-                    )
+                token = f"{job_payload['title'].lower()}|{job_payload['apply_link'].lower()}"
+                if token in seen_tokens:
+                    continue
+                seen_tokens.add(token)
 
-                wrote_primary = False
-                if callable(append_primary_fn) and callable(append_opening_fn):
-                    status = "Changed Opening" if opening in new_openings else "Tracked Opening"
-                    wrote_primary = bool(
-                        append_primary_fn(
-                            {
-                                "timestamp": now,
-                                "job_title": opening_title,
-                                "company": domain,
-                                "location": "",
-                                "job_type": "Career Page Monitor",
-                                "posted_date": now[:10],
-                                "apply_link": opening_link,
-                                "description": (
-                                    f"Detected from links.txt monitored career page. "
-                                    f"Source URL: {url}. Change type: {change_type}."
-                                ),
-                                "matched_keywords": "LINKS_TXT_CHANGE",
-                                "status": status,
-                                "notes": (
-                                    f"Source: links.txt | Career URL: {url} | "
-                                    f"Resolved URL: {resolved_url or url} | Scraper: {scraper_used} | "
-                                    f"Position URL: {opening_link}"
-                                )[:500],
-                                "ai_score": "",
-                            }
-                        )
-                    )
+                opening_payloads.append(
+                    {
+                        "timestamp": now,
+                        "job_title": job_payload["title"],
+                        "company": job_payload["company"],
+                        "location": job_payload["location"],
+                        "type": job_payload["type"],
+                        "apply_link": job_payload["apply_link"],
+                        "posted_date": job_payload["posted_date"],
+                        "source_url": job_payload["source_url"],
+                        "status": "New" if opening in new_openings else "Tracked",
+                    }
+                )
 
-                if wrote_primary:
-                    appended_primary_rows += 1
+        appended_changes = 0
+        append_change_rows_fn = getattr(self._sheets, "append_url_change_rows", None)
+        if callable(append_change_rows_fn):
+            try:
+                appended_changes = int(append_change_rows_fn(change_payloads))
+            except Exception as exc:
+                log.warning("Batch URL change append failed, falling back to single rows: %s", exc)
 
-                if wrote_opening:
-                    appended_openings += 1
+        if appended_changes == 0 and change_payloads:
+            append_url_change_fn = getattr(self._sheets, "append_url_change_row", None)
+            if callable(append_url_change_fn):
+                for payload in change_payloads:
+                    if bool(append_url_change_fn(payload)):
+                        appended_changes += 1
 
-        if appended_changes < len(events):
-            log.warning("Sheets URL change logging partial success: %d/%d", appended_changes, len(events))
+        appended_openings = 0
+        append_opening_rows_fn = getattr(self._sheets, "append_career_opening_rows", None)
+        if callable(append_opening_rows_fn):
+            try:
+                appended_openings = int(append_opening_rows_fn(opening_payloads))
+            except Exception as exc:
+                log.warning("Batch opening append failed, falling back to single rows: %s", exc)
+
+        if appended_openings == 0 and opening_payloads:
+            append_opening_fn = getattr(self._sheets, "append_career_opening_row", None)
+            if callable(append_opening_fn):
+                for payload in opening_payloads:
+                    if bool(append_opening_fn(payload)):
+                        appended_openings += 1
+
+        if appended_changes < len(change_payloads):
+            log.warning("Sheets URL change logging partial success: %d/%d", appended_changes, len(change_payloads))
 
         log.info(
-            "Sheets URL logging summary: change rows=%d/%d, opening rows=%d, primary rows=%d",
+            "Sheets URL logging summary: change rows=%d/%d, validated opening rows=%d",
             appended_changes,
-            len(events),
+            len(change_payloads),
             appended_openings,
-            appended_primary_rows,
         )
-        return appended_changes > 0
+        return appended_openings > 0 or appended_changes > 0
 
     def update_job_in_sheet(
         self, apply_link: str, status: str, notes: str = "",

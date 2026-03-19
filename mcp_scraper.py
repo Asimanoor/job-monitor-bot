@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from job_scraper import extract_job_postings, is_valid_job_posting
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,8 @@ _ATS_DOMAIN_HINTS = (
     "myworkdayjobs.com",
     "smartrecruiters.com",
     "jobvite.com",
+    "sapsf.eu",
+    "successfactors.com",
 )
 
 
@@ -135,6 +138,9 @@ def _extract_openings_from_jsonld(base_url: str, soup: BeautifulSoup, max_openin
             if link:
                 link = urljoin(base_url, link)
 
+            if not is_valid_job_posting({"title": title, "apply_link": link, "job_url": link}):
+                continue
+
             item = {"title": title, "link": link or base_url}
             fp = _opening_fingerprint(item)
             if fp in seen:
@@ -154,7 +160,14 @@ def _extract_openings_from_html(base_url: str, html: str, max_openings: int) -> 
     openings: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    for item in _extract_openings_from_jsonld(base_url, soup, max_openings=max_openings):
+    strict_jobs = extract_job_postings(html, base_url, max_results=max_openings)
+    for job in strict_jobs:
+        item = {
+            "title": _normalize_whitespace(str(job.get("title") or "")),
+            "link": str(job.get("apply_link") or job.get("job_url") or "").strip(),
+        }
+        if not item["title"] or not item["link"]:
+            continue
         fp = _opening_fingerprint(item)
         if fp in seen:
             continue
@@ -163,29 +176,14 @@ def _extract_openings_from_html(base_url: str, html: str, max_openings: int) -> 
         if len(openings) >= max_openings:
             return page_title, openings
 
-    for anchor in soup.find_all("a", href=True):
-        title = _normalize_whitespace(anchor.get_text(" ", strip=True))
-        if not _looks_like_opening_title(title):
-            continue
-
-        href = (anchor.get("href") or "").strip()
-        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            continue
-
-        absolute_link = urljoin(base_url, href)
-        parsed = urlparse(absolute_link)
-        if parsed.scheme not in {"http", "https"}:
-            continue
-
-        item = {"title": title, "link": absolute_link}
+    for item in _extract_openings_from_jsonld(base_url, soup, max_openings=max_openings):
         fp = _opening_fingerprint(item)
         if fp in seen:
             continue
-
         seen.add(fp)
         openings.append(item)
         if len(openings) >= max_openings:
-            break
+            return page_title, openings
 
     return page_title, openings
 
@@ -238,9 +236,26 @@ def _extract_pagination_links(base_url: str, html: str, max_links: int = 12) -> 
 
         absolute = urljoin(base_url, href)
         parsed = urlparse(absolute)
+        absolute_lower = absolute.lower()
 
         if parsed.scheme not in {"http", "https"}:
             continue
+
+        if any(
+            bad in absolute_lower
+            for bad in (
+                "/blog",
+                "/news",
+                "/insight",
+                "/service",
+                "/privacy",
+                "/cookie",
+                "/terms",
+                "/sitemap",
+            )
+        ):
+            continue
+
         candidate_host = parsed.netloc.lower().split(":")[0]
         if not _is_related_pagination_domain(base_host, candidate_host):
             continue

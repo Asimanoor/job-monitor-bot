@@ -40,6 +40,8 @@ class ConfigLoader:
             "playwright_max_openings_per_page": 80,
             "link_scraper_max_openings_per_site": 300,
             "link_scraper_max_pages": 8,
+            "url_monitor_async_concurrency": 4,
+            "jsearch_async_concurrency": 2,
         }
 
     def _load_from_file(self) -> None:
@@ -162,6 +164,16 @@ class ConfigLoader:
         if "LINK_SCRAPER_MAX_PAGES" in os.environ:
             try:
                 self.config["link_scraper_max_pages"] = int(os.environ["LINK_SCRAPER_MAX_PAGES"])
+            except ValueError:
+                pass
+        if "URL_MONITOR_ASYNC_CONCURRENCY" in os.environ:
+            try:
+                self.config["url_monitor_async_concurrency"] = int(os.environ["URL_MONITOR_ASYNC_CONCURRENCY"])
+            except ValueError:
+                pass
+        if "JSEARCH_ASYNC_CONCURRENCY" in os.environ:
+            try:
+                self.config["jsearch_async_concurrency"] = int(os.environ["JSEARCH_ASYNC_CONCURRENCY"])
             except ValueError:
                 pass
 

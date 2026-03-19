@@ -64,14 +64,14 @@ URL_CHANGES_HEADERS = [
 CAREER_OPENINGS_WORKSHEET = "Career Openings Log"
 CAREER_OPENINGS_HEADERS = [
     "Timestamp",
-    "Source Career URL",
-    "Domain",
-    "Position Title",
-    "Position Link",
-    "Change Type",
-    "Page Title",
-    "Is New Opening",
-    "Notes",
+    "Job Title",
+    "Company",
+    "Location",
+    "Type",
+    "Apply Link",
+    "Posted Date",
+    "Source URL",
+    "Status",
 ]
 
 
@@ -129,6 +129,9 @@ class GoogleSheetsClient:
             raise
 
         self._ws = self._spreadsheet.sheet1
+        self._worksheet_cache: dict[str, Any] = {self._ws.title: self._ws}
+        self._header_initialized: set[str] = set()
+        self._primary_header_checked = False
         log.info(
             "GoogleSheetsClient ready — sheet '%s' (%s), worksheet '%s'",
             self._spreadsheet.title, sheet_id, self._ws.title,
@@ -154,6 +157,9 @@ class GoogleSheetsClient:
 
     def _ensure_header_row(self) -> None:
         """Create the header row if the sheet is empty."""
+        if self._primary_header_checked:
+            return
+
         try:
             first = self._ws.row_values(1)
         except Exception:
@@ -168,6 +174,7 @@ class GoogleSheetsClient:
         if not first or first[0] != "Timestamp":
             self._retry_on_quota(self._ws.update, "A1:L1", [headers])
             log.info("Created header row in worksheet.")
+            self._primary_header_checked = True
             return
 
         # Upgrade legacy header that does not include AI_Score.
@@ -177,6 +184,8 @@ class GoogleSheetsClient:
                 merged[11] = "AI_Score"
                 self._retry_on_quota(self._ws.update, "A1:L1", [merged])
                 log.info("Updated header row to include AI_Score column.")
+
+        self._primary_header_checked = True
 
     @staticmethod
     def _column_letter(index: int) -> str:
@@ -190,6 +199,10 @@ class GoogleSheetsClient:
 
     def _get_or_create_worksheet(self, title: str, headers: list[str], rows: int = 2000):
         """Fetch worksheet by title or create it, then enforce header row."""
+        cached = self._worksheet_cache.get(title)
+        if cached is not None:
+            return cached
+
         try:
             ws = self._spreadsheet.worksheet(title)
         except gspread.exceptions.WorksheetNotFound:
@@ -199,14 +212,18 @@ class GoogleSheetsClient:
                 cols=max(len(headers), 9),
             )
 
-        try:
-            first = ws.row_values(1)
-        except Exception:
-            first = []
+        if title not in self._header_initialized:
+            try:
+                first = ws.row_values(1)
+            except Exception:
+                first = []
 
-        if first != headers:
-            end_col = self._column_letter(len(headers))
-            self._retry_on_quota(ws.update, f"A1:{end_col}1", [headers])
+            if first != headers:
+                end_col = self._column_letter(len(headers))
+                self._retry_on_quota(ws.update, f"A1:{end_col}1", [headers])
+            self._header_initialized.add(title)
+
+        self._worksheet_cache[title] = ws
 
         return ws
 
@@ -256,51 +273,94 @@ class GoogleSheetsClient:
             log.error("Unexpected error appending row: %s", exc)
         return False
 
+    def _append_rows_optimized(self, ws: Any, rows: list[list[Any]]) -> int:
+        """Append multiple rows efficiently, falling back to single-row appends if needed."""
+        if not rows:
+            return 0
+
+        append_rows_fn = getattr(ws, "append_rows", None)
+        if callable(append_rows_fn):
+            self._retry_on_quota(append_rows_fn, rows, value_input_option="USER_ENTERED")
+            return len(rows)
+
+        appended = 0
+        for row in rows:
+            self._retry_on_quota(ws.append_row, row, value_input_option="USER_ENTERED")
+            appended += 1
+        return appended
+
+    @staticmethod
+    def _build_url_change_row(change_data: dict) -> list[Any]:
+        preview_titles = change_data.get("new_opening_titles_preview", "")
+        if isinstance(preview_titles, list):
+            preview_titles = " | ".join(str(t) for t in preview_titles[:5])
+
+        return [
+            change_data.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+            change_data.get("url", ""),
+            change_data.get("domain", ""),
+            change_data.get("change_type", ""),
+            change_data.get("page_title", ""),
+            change_data.get("total_openings", 0),
+            change_data.get("new_openings_count", 0),
+            str(preview_titles),
+            change_data.get("notes", ""),
+        ]
+
+    @staticmethod
+    def _build_career_opening_row(opening_data: dict) -> list[Any]:
+        title = opening_data.get("job_title") or opening_data.get("position_title") or ""
+        company = opening_data.get("company") or opening_data.get("domain") or ""
+        location = opening_data.get("location") or ""
+        job_type = opening_data.get("type") or opening_data.get("job_type") or ""
+        apply_link = opening_data.get("apply_link") or opening_data.get("position_link") or ""
+        posted_date = opening_data.get("posted_date") or ""
+        source_url = opening_data.get("source_url") or opening_data.get("career_url") or ""
+        status = opening_data.get("status") or ("New" if bool(opening_data.get("is_new", True)) else "Tracked")
+
+        return [
+            opening_data.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+            title,
+            company,
+            location,
+            job_type,
+            apply_link,
+            posted_date,
+            source_url,
+            status,
+        ]
+
     def append_url_change_row(self, change_data: dict) -> bool:
         """Append one URL/page-change event to dedicated worksheet."""
+        return self.append_url_change_rows([change_data]) > 0
+
+    def append_url_change_rows(self, change_rows: list[dict]) -> int:
+        """Append URL/page-change events in batch. Returns appended row count."""
+        if not change_rows:
+            return 0
         try:
             ws = self._get_or_create_worksheet(URL_CHANGES_WORKSHEET, URL_CHANGES_HEADERS)
-            preview_titles = change_data.get("new_opening_titles_preview", "")
-            if isinstance(preview_titles, list):
-                preview_titles = " | ".join(str(t) for t in preview_titles[:5])
-
-            row = [
-                change_data.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
-                change_data.get("url", ""),
-                change_data.get("domain", ""),
-                change_data.get("change_type", ""),
-                change_data.get("page_title", ""),
-                change_data.get("total_openings", 0),
-                change_data.get("new_openings_count", 0),
-                str(preview_titles),
-                change_data.get("notes", ""),
-            ]
-            self._retry_on_quota(ws.append_row, row, value_input_option="USER_ENTERED")
-            return True
+            rows = [self._build_url_change_row(item) for item in change_rows]
+            return self._append_rows_optimized(ws, rows)
         except Exception as exc:
-            log.error("Failed to append URL change row: %s", exc)
-            return False
+            log.error("Failed to append URL change rows: %s", exc)
+            return 0
 
     def append_career_opening_row(self, opening_data: dict) -> bool:
         """Append one detected career opening row to dedicated worksheet."""
+        return self.append_career_opening_rows([opening_data]) > 0
+
+    def append_career_opening_rows(self, opening_rows: list[dict]) -> int:
+        """Append detected career opening rows in batch. Returns appended row count."""
+        if not opening_rows:
+            return 0
         try:
             ws = self._get_or_create_worksheet(CAREER_OPENINGS_WORKSHEET, CAREER_OPENINGS_HEADERS)
-            row = [
-                opening_data.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
-                opening_data.get("source_url", ""),
-                opening_data.get("domain", ""),
-                opening_data.get("position_title", ""),
-                opening_data.get("position_link", ""),
-                opening_data.get("change_type", ""),
-                opening_data.get("page_title", ""),
-                "YES" if bool(opening_data.get("is_new", False)) else "NO",
-                opening_data.get("notes", ""),
-            ]
-            self._retry_on_quota(ws.append_row, row, value_input_option="USER_ENTERED")
-            return True
+            rows = [self._build_career_opening_row(item) for item in opening_rows]
+            return self._append_rows_optimized(ws, rows)
         except Exception as exc:
-            log.error("Failed to append career opening row: %s", exc)
-            return False
+            log.error("Failed to append career opening rows: %s", exc)
+            return 0
 
     def update_job_status(
         self,

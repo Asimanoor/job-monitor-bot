@@ -305,16 +305,17 @@ class EmailNotifier:
             f"  • {ch}: {'❌ FAILED' if v is False else v}" for ch, v in health_results.items())
         plain = f"Health Check Warning — {now}\n\n{rows}\n\nPlease check your configuration."
 
-        html_rows = "".join(
-            (
+        row_chunks: list[str] = []
+        for ch, v in health_results.items():
+            color = "#e53e3e" if v is False else "#38a169"
+            label = "❌ FAILED" if v is False else ("✅ OK" if v is True else str(v))
+            row_chunks.append(
                 "<tr>"
                 f"<td style='padding:6px 12px'><strong>{ch}</strong></td>"
-                f"<td style='padding:6px 12px;color:{'#e53e3e' if v is False else '#38a169'}'>"
-                f"{'❌ FAILED' if v is False else ('✅ OK' if v is True else str(v))}</td>"
+                f"<td style='padding:6px 12px;color:{color}'>{label}</td>"
                 "</tr>"
             )
-            for ch, v in health_results.items()
-        )
+        html_rows = "".join(row_chunks)
 
         html = f"""\
 <html>
