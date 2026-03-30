@@ -98,6 +98,54 @@ ROLE_TITLE_KEYWORDS = {
      "graduate", "associate",
     }
 
+_STRICT_ALLOWED_PHRASES = [
+    "associate software engineer",
+    "associate ai engineer",
+    "associate ml engineer",
+    "associate data engineer",
+    "junior software engineer",
+    "fresh graduate",
+    "entry level",
+    "entry-level",
+    "graduate trainee",
+    "0-2 years",
+    "0 2 years",
+    "1 year",
+    "2 years",
+]
+
+_STRICT_BASE_ROLES = [
+    "software engineer",
+    "ai engineer",
+    "ml engineer",
+    "data engineer",
+]
+
+_STRICT_ENTRY_HINTS = [
+    "associate",
+    "junior",
+    "fresh graduate",
+    "entry level",
+    "entry-level",
+    "graduate trainee",
+    "0-2 years",
+    "0 2 years",
+    "1 year",
+    "2 years",
+]
+
+_STRICT_REJECT_TOKENS = [
+    "iii",
+    "iv",
+    "level",
+    "senior",
+    "lead",
+    "manager",
+    "architect",
+    "principal",
+    "director",
+]
+
 # ── Seniority keywords to EXCLUDE (user wants entry/junior roles) ────────────
 SENIOR_TITLE_KEYWORDS = [
     "senior", "sr.", "sr ", "lead", "principal", "staff",
@@ -152,6 +200,30 @@ def _normalize(text: str) -> str:
     text = text.lower()
     text = re.sub(r"[^\w\s]", " ", text)
     return " ".join(text.split())
+
+
+def _contains_any_token(text: str, tokens: list[str]) -> bool:
+    for token in tokens:
+        pattern = r"\b" + re.escape(str(token).lower()) + r"\b"
+        if re.search(pattern, text):
+            return True
+    return False
+
+
+def _passes_strict_role_policy(title: str) -> bool:
+    normalized = _normalize(str(title or ""))
+    if not normalized:
+        return False
+
+    if _contains_any_token(normalized, _STRICT_REJECT_TOKENS):
+        return False
+
+    if any(phrase in normalized for phrase in _STRICT_ALLOWED_PHRASES):
+        return True
+
+    has_base_role = any(role in normalized for role in _STRICT_BASE_ROLES)
+    has_entry_hint = any(hint in normalized for hint in _STRICT_ENTRY_HINTS)
+    return has_base_role and has_entry_hint
 
 
 def _word_boundary_match(text: str, keywords: list[str]) -> str | None:
@@ -258,6 +330,9 @@ def matches_target_role(
         - score: Relevance score 0-100
     """
     if not title or not title.strip():
+        return False, None, 0.0
+
+    if not _passes_strict_role_policy(title):
         return False, None, 0.0
 
     # Hard gate: reject obvious service/marketing/non-job strings early.
@@ -483,6 +558,9 @@ def filter_jobs_by_role(
         description = str(job.get("description", "")).strip()
 
         if not title:
+            continue
+
+        if not _passes_strict_role_policy(title):
             continue
 
         # Skip non-job titles

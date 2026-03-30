@@ -27,6 +27,8 @@ def normalize_title(value: str) -> str:
     text = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}", " ", text)
     # Normalize separators to spaces: -, |, /
     text = re.sub(r"[|\-/]+", " ", text)
+    # Remove remaining punctuation/symbol noise.
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
     return re.sub(r"\s+", " ", text).strip()
 
 

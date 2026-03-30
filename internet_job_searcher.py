@@ -370,11 +370,11 @@ class InternetJobSearcher:
         # Intentionally reduced set to avoid rate limits (top 5 only).
         company = cls._clean_company_query(company_name)
         return [
-            f'"{company}" careers',
-            f'"{company}" jobs pakistan',
-            f'"{company}" associate software engineer',
+            f'"{company}" careers pakistan',
+            f'"{company}" associate software engineer pakistan',
+            f'"{company}" ai engineer pakistan',
+            f'"{company}" fresh graduate jobs pakistan',
             f'"{company}" site:lever.co',
-            f'"{company}" site:greenhouse.io',
         ]
 
     @staticmethod
@@ -1105,6 +1105,7 @@ def search_internet_for_companies(
     enable_bing_fallback: bool = True,
     max_empty_companies_before_abort: int = 5,
     inter_company_delay_seconds: float = 0.5,
+    company_names: list[str] | None = None,
 ) -> list[str]:
     """
     Discover career URLs via internet fallback for companies in links.txt.
@@ -1149,17 +1150,27 @@ def search_internet_for_companies(
             log.warning("Could not read allowed companies file %s: %s", allowed_companies_file, exc)
 
     candidate_pairs: list[tuple[str, str]] = []
-    for company_url in links[:max_companies]:
-        company_name = extractor.extract_from_url(company_url)
-        if not company_name:
-            continue
-        if len(company_name) < 2 or len(company_name) > 100:
-            continue
+    if company_names:
+        for company_name in company_names[:max_companies]:
+            clean_name = str(company_name or "").strip()
+            if len(clean_name) < 2 or len(clean_name) > 100:
+                continue
+            company_key = re.sub(r"[^a-z0-9]", "", clean_name.lower())
+            if allowed_normalized and company_key not in allowed_normalized:
+                continue
+            candidate_pairs.append((clean_name, ""))
+    else:
+        for company_url in links[:max_companies]:
+            company_name = extractor.extract_from_url(company_url)
+            if not company_name:
+                continue
+            if len(company_name) < 2 or len(company_name) > 100:
+                continue
 
-        company_key = re.sub(r"[^a-z0-9]", "", company_name.strip().lower())
-        if allowed_normalized and company_key not in allowed_normalized:
-            continue
-        candidate_pairs.append((company_name, company_url))
+            company_key = re.sub(r"[^a-z0-9]", "", company_name.strip().lower())
+            if allowed_normalized and company_key not in allowed_normalized:
+                continue
+            candidate_pairs.append((company_name, company_url))
 
     if not candidate_pairs:
         return discovered_urls

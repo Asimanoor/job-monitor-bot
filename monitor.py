@@ -16,6 +16,7 @@ import sys
 import time
 import requests
 from datetime import datetime, timezone
+from typing import Any
 from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -63,6 +64,11 @@ STATE_FILE = os.path.join(SCRIPT_DIR, "state.json")
 PAUSE_FILE = os.path.join(SCRIPT_DIR, "pause.txt")
 LOCK_FILE = os.path.join(SCRIPT_DIR, "monitor.lock")
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
+COMPANIES_PAK_FILE = os.path.join(SCRIPT_DIR, "companies_pak.txt")
+COMPANIES_LINKS_FILE = os.path.join(SCRIPT_DIR, "companies_links.txt")
+SEARCH_QUERIES_FILE = os.path.join(SCRIPT_DIR, "search_queries.txt")
+JOB_TITLES_FILE = os.path.join(SCRIPT_DIR, "jobs_titles.txt")
+CLOSED_JOBS_FILE = os.path.join(SCRIPT_DIR, "closed_jobs.json")
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -96,6 +102,164 @@ _COMPANY_STOP_WORDS = {
     "global", "group", "inc", "llc", "ltd", "limited", "co", "company",
     "com", "io", "net", "org", "ai", "pk", "eu", "hr", "site",
 }
+
+_REQUIRED_COMPANIES = [
+    "Systems Limited",
+    "Arbisoft",
+    "Confiz",
+    "Tkxel",
+    "10Pearls",
+    "VentureDive",
+    "Netsol",
+    "Contour Software",
+    "Afiniti",
+    "Careem",
+    "DubizzleLabs",
+    "Motive",
+    "Educative",
+    "Bazaar Technologies",
+    "Retailo",
+    "Sadapay",
+    "Nayapay",
+    "Daraz",
+    "Folium AI",
+    "Nextbridge",
+    "PureLogics",
+    "Invozone",
+    "Devsinc",
+    "Programmers Force",
+    "NorthBay Solutions",
+    "Techlogix",
+    "Folio3",
+    "SSI",
+    "i2c",
+    "CureMD",
+    "Conrad Labs",
+    "ZAPTA",
+    "GoSaaS",
+    "CodeNinja",
+    "Cubix",
+    "Tajir",
+    "Aitomation",
+    "Manafatech",
+    "Strategic Systems International",
+]
+
+_STRICT_TARGET_ROLE_TITLES = [
+    "Associate Software Engineer",
+    "Associate AI Engineer",
+    "Associate ML Engineer",
+    "Associate Data Engineer",
+    "Entry Level Software Engineer",
+    "Fresh Graduate Engineer",
+    "Junior Software Engineer",
+    "Junior AI Engineer",
+    "Junior ML Engineer",
+    "Graduate Trainee Engineer",
+    "Software Engineer (0-2 years)",
+    "AI Engineer (0-2 years)",
+    "ML Engineer (0-2 years)",
+    "Data Scientist (0-2 years)",
+    "Data Engineer (0-2 years)",
+]
+
+
+def _ensure_required_seed_files() -> None:
+    """Create required text/json files when missing, preserving existing user files."""
+    seeds: list[tuple[str, str]] = [
+        (COMPANIES_PAK_FILE, "\n".join(_REQUIRED_COMPANIES) + "\n"),
+        (JOB_TITLES_FILE, "\n".join(_STRICT_TARGET_ROLE_TITLES) + "\n"),
+        (
+            SEARCH_QUERIES_FILE,
+            "\n".join(
+                [
+                    '"{company}" careers pakistan',
+                    '"{company}" associate software engineer pakistan',
+                    '"{company}" ai engineer pakistan',
+                    '"{company}" fresh graduate jobs pakistan',
+                ]
+            )
+            + "\n",
+        ),
+        (
+            FILTERS_FILE,
+            "\n".join(["associate", "junior", "entry level", "fresh", "graduate trainee", "0-2 years"]) + "\n",
+        ),
+    ]
+
+    for path, content in seeds:
+        if os.path.isfile(path):
+            continue
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            log.info("Created missing required file: %s", path)
+        except Exception as exc:
+            log.warning("Could not create required file %s: %s", path, exc)
+
+    if not os.path.isfile(CLOSED_JOBS_FILE):
+        try:
+            with open(CLOSED_JOBS_FILE, "w", encoding="utf-8") as f:
+                json.dump([], f, ensure_ascii=False, indent=2)
+            log.info("Created missing required file: %s", CLOSED_JOBS_FILE)
+        except Exception as exc:
+            log.warning("Could not create required file %s: %s", CLOSED_JOBS_FILE, exc)
+
+    if not os.path.isfile(STATE_FILE):
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump({"notified_ids": [], "url_hashes": {}, "job_hash_state": {}}, f, ensure_ascii=False, indent=2)
+            log.info("Created missing required file: %s", STATE_FILE)
+        except Exception as exc:
+            log.warning("Could not create required file %s: %s", STATE_FILE, exc)
+
+    if not os.path.isfile(COMPANIES_LINKS_FILE) and os.path.isfile(LINKS_FILE):
+        try:
+            urls = ConfigLoader.load_urls(LINKS_FILE)
+            hints = extract_company_hints_from_urls(urls, max_companies=max(1, len(urls)))
+            lines: list[str] = []
+            for idx, url in enumerate(urls):
+                name = hints[idx] if idx < len(hints) else (urlparse(url).netloc or "Unknown")
+                lines.append(f"{name}\t{url}")
+            with open(COMPANIES_LINKS_FILE, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + ("\n" if lines else ""))
+            log.info("Created missing required file: %s", COMPANIES_LINKS_FILE)
+        except Exception as exc:
+            log.warning("Could not create required file %s: %s", COMPANIES_LINKS_FILE, exc)
+
+
+def _persist_closed_jobs(closed_jobs: list[dict[str, Any]]) -> None:
+    """Append newly closed jobs into closed_jobs.json with hash-based dedupe."""
+    if not closed_jobs:
+        return
+
+    existing: list[dict[str, Any]] = []
+    try:
+        if os.path.isfile(CLOSED_JOBS_FILE):
+            with open(CLOSED_JOBS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, list):
+                existing = [item for item in raw if isinstance(item, dict)]
+    except Exception:
+        existing = []
+
+    seen_hashes = {str(item.get("hash_id") or "").strip() for item in existing if str(item.get("hash_id") or "").strip()}
+    merged = list(existing)
+    for item in closed_jobs:
+        if not isinstance(item, dict):
+            continue
+        hash_id = str(item.get("hash_id") or "").strip()
+        if hash_id and hash_id in seen_hashes:
+            continue
+        merged.append(item)
+        if hash_id:
+            seen_hashes.add(hash_id)
+
+    try:
+        with open(CLOSED_JOBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(merged, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        log.warning("Failed to persist closed jobs file %s: %s", CLOSED_JOBS_FILE, exc)
 
 
 def _acquire_monitor_lock(lock_file: str = LOCK_FILE, stale_after_seconds: int = 24 * 3600) -> dict[str, str] | None:
@@ -1500,6 +1664,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         return
 
     # 2. Load config and state
+    _ensure_required_seed_files()
     config = ConfigLoader()
     state_mgr = StateManager(STATE_FILE, config.get("max_notified_ids"))
 
@@ -1603,7 +1768,8 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     log.info("Monitor run metadata: id=%s iteration=%d at=%s", run_id, run_iteration, now_utc)
 
     # 4. Prepare search inputs and API query budget
-    titles = ConfigLoader.load_job_titles(JOBS_FILE)
+    titles_source = JOB_TITLES_FILE if os.path.isfile(JOB_TITLES_FILE) else JOBS_FILE
+    titles = ConfigLoader.load_job_titles(titles_source)
     filters = ConfigLoader.load_filters(FILTERS_FILE)
     locations = config.get("search_locations")
     monitored_urls = ConfigLoader.load_urls(LINKS_FILE)
@@ -1692,12 +1858,32 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     fallback_jobs_found = 0
     fallback_discovered_urls: list[str] = []
 
+    zero_job_companies: list[str] = []
+    for site in primary_site_outcomes:
+        if not bool(site.get("ok")):
+            continue
+        if int(site.get("jobs_count", 0) or 0) != 0:
+            continue
+        source_url = str(site.get("url") or "").strip()
+        if not source_url:
+            continue
+        hints = extract_company_hints_from_urls([source_url], max_companies=1)
+        if hints:
+            zero_job_companies.append(hints[0])
+
+    zero_job_companies = sorted({str(name).strip() for name in zero_job_companies if str(name).strip()})
+
     if (
         enable_internet_fallback
         and search_internet_for_companies is not None
-        and primary_jobs_found < min_expected_jobs
+        and (primary_jobs_found < min_expected_jobs or len(zero_job_companies) > 0)
     ):
-        log.info("Running fallback search...")
+        log.info(
+            "Running fallback search... (primary_jobs=%d, threshold=%d, zero_job_companies=%d)",
+            primary_jobs_found,
+            min_expected_jobs,
+            len(zero_job_companies),
+        )
         raw_fallback_urls = _run_async(
             asyncio.to_thread(
                 search_internet_for_companies,
@@ -1705,13 +1891,14 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 int(config.get("internet_search_max_companies", 8)),
                 int(config.get("internet_search_max_results_per_company", 2)),
                 max(3, int(config.get("internet_search_timeout_seconds", 8))),
-                os.path.join(SCRIPT_DIR, "companies_pakistan.txt"),
+                COMPANIES_PAK_FILE,
                 max(1, int(config.get("internet_search_query_variants_limit", 5))),
                 max(1, int(config.get("internet_search_provider_fail_threshold", 3))),
                 max(60, int(config.get("internet_search_provider_block_cooldown_seconds", 1800))),
                 _as_bool(config.get("internet_search_enable_bing_fallback", True), default=True),
                 max(1, int(config.get("internet_search_max_empty_companies_before_abort", 5))),
                 max(0.0, float(config.get("internet_search_inter_company_delay_seconds", 0.5))),
+                zero_job_companies if zero_job_companies else None,
             )
         )
         fallback_discovered_urls = _dedupe_fallback_urls(
@@ -1748,7 +1935,11 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         else:
             log.info("Fallback jobs found: 0")
     elif enable_internet_fallback:
-        log.info("Fallback skipped: primary jobs (%d) reached threshold (%d).", primary_jobs_found, min_expected_jobs)
+        log.info(
+            "Fallback skipped: primary jobs (%d) reached threshold (%d) and no zero-job companies.",
+            primary_jobs_found,
+            min_expected_jobs,
+        )
 
     log.info("Total jobs: %d", primary_jobs_found + fallback_jobs_found)
 
@@ -1758,13 +1949,15 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
             row["run_iteration"] = run_iteration
 
     previous_company_state = state_mgr.get_company_job_state()
-    baseline_required = (not state_mgr.is_baseline_initialized()) or (not state_mgr.has_company_job_state())
+    baseline_required = False
     append_only_history = _as_bool(config.get("append_only_openings_history", True), default=True)
     remove_closed_rows = _as_bool(config.get("remove_closed_rows", False), default=False)
-    delete_closed_rows = bool(remove_closed_rows and not append_only_history)
+    delete_closed_rows = True
     if append_only_history and remove_closed_rows:
         log.info("append_only_openings_history=true; closed rows will be retained in sheet history.")
-    missing_threshold = max(1, int(config.get("closed_missing_threshold", 2)))
+    if not remove_closed_rows:
+        log.info("Closed-job enforcement enabled: closed rows will be removed from ACTIVE sheets.")
+    missing_threshold = 1
 
     previous_hash_state = state_mgr.get_job_hash_state()
     post_hash_state = previous_hash_state
@@ -1819,11 +2012,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 for job in jobs.values():
                     if isinstance(job, dict):
                         active_jobs_for_sheet.append(dict(job))
-        log.info(
-            "Baseline initialization mode: captured %d active jobs across %d companies; suppressing NEW/UPDATED/removals this cycle.",
-            len(active_jobs_for_sheet),
-            len(company_state_current),
-        )
+        log.info("Baseline initialization mode active.")
         if not args.dry_run:
             state_mgr.set_job_hash_state(current_jobs_by_hash, now_ts=now_utc)
             post_hash_state = state_mgr.get_job_hash_state()
@@ -1874,15 +2063,23 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 }
             )
 
+        changed_source_urls = sorted(
+            {
+                str(item.get("source_url") or "").strip()
+                for item in (new_jobs_for_sheet + updated_jobs_for_sheet)
+                if isinstance(item, dict) and str(item.get("source_url") or "").strip()
+            }
+        )
         url_change_events = [
             {
-                "url": str(job.get("source_url") or ""),
-                "domain": urlparse(str(job.get("source_url") or "")).netloc,
+                "url": src,
+                "domain": urlparse(src).netloc,
                 "change_type": "job_level_diff",
                 "new_openings_count": len(new_jobs_for_sheet),
                 "opening_changes_count": len(new_jobs_for_sheet) + len(updated_jobs_for_sheet),
             }
-        ] if (new_jobs_for_sheet or updated_jobs_for_sheet) else []
+            for src in changed_source_urls
+        ]
 
     def _enrich_lifecycle_fields(rows: list[dict]) -> None:
         for row in rows:
@@ -2139,6 +2336,14 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     jobs_found_total = sum(int(item.get("jobs_count", 0) or 0) for item in site_outcomes)
     jobs_added_count = len(new_jobs_for_sheet)
     jobs_closed_count = len(closed_jobs_for_sheet)
+    jobs_filtered_count = max(0, int(jobs_found_total) - int(len(active_jobs_for_sheet)))
+
+    log.info("Jobs scraped: %d", jobs_found_total)
+    log.info("Jobs filtered: %d", jobs_filtered_count)
+    log.info("New jobs: %d", len(new_jobs_for_sheet))
+    log.info("Closed jobs: %d", len(closed_jobs_for_sheet))
+    log.info("Active jobs: %d", len(active_jobs_for_sheet))
+    log.info("Companies failed: %d", sites_failed)
 
     print("=" * 60)
     print("  SCRAPER SUCCESS METRICS")
@@ -2211,6 +2416,8 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 removed_by_company[company_name] = removed_by_company.get(company_name, 0) + 1
             for company_name, count in sorted(removed_by_company.items()):
                 log.info("Company: %s, removed: %d", company_name, count)
+
+        _persist_closed_jobs(closed_jobs_for_sheet)
 
     # 6. Notify (job alerts only)
     if new_jobs:

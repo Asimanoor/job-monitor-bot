@@ -7,6 +7,14 @@ from classifier import is_associate_role
 
 log = logging.getLogger(__name__)
 
+_REQUIRED_COMPANY_SHEETS = [
+	"Confiz",
+	"Tkxel",
+	"Dubizzlelabs",
+	"Sadapay",
+	"Venturedive",
+]
+
 
 class SheetWriter:
 	"""Coordinate normalized, deduped writes into worksheets in strict order."""
@@ -114,33 +122,16 @@ class SheetWriter:
 		run_iteration = int(run_meta.get("run_iteration", 0) or 0)
 		run_timestamp = str(run_meta.get("run_timestamp") or "")
 
-		new_hashes = {
-			str(job.get("hash_id") or "").strip().lower()
-			for job in (new_jobs or [])
-			if str(job.get("hash_id") or "").strip()
-		}
-		updated_hashes = {
-			str(job.get("hash_id") or "").strip().lower()
-			for job in (updated_jobs or [])
-			if str(job.get("hash_id") or "").strip()
-		}
-
-		all_snapshot_rows: list[dict] = []
-		for job in active_jobs:
-			hash_id = str(job.get("hash_id") or "").strip().lower()
-			if hash_id and hash_id in new_hashes:
-				status = "NEW"
-			else:
-				status = "ACTIVE"
-			all_snapshot_rows.append(
-				self._row_for_all(
-					job,
-					status=status,
-					run_id=run_id,
-					run_iteration=run_iteration,
-					run_timestamp=run_timestamp,
-				)
+		all_snapshot_rows = [
+			self._row_for_all(
+				job,
+				status="ACTIVE",
+				run_id=run_id,
+				run_iteration=run_iteration,
+				run_timestamp=run_timestamp,
 			)
+			for job in active_jobs
+		]
 
 		delta_rows = [
 			self._row_for_all(
@@ -154,13 +145,14 @@ class SheetWriter:
 		] + [
 			self._row_for_all(
 				job,
-				status="ACTIVE",
+				status="UPDATED",
 				run_id=run_id,
 				run_iteration=run_iteration,
 				run_timestamp=run_timestamp,
 			)
 			for job in updated_jobs
 		]
+
 		closed_rows = [
 			self._row_for_all(
 				job,
@@ -182,21 +174,25 @@ class SheetWriter:
 		removed_company = 0
 		removed_total = 0
 
+		replace_active = getattr(self.sheets, "replace_active_jobs_rows", None)
 		append_all = getattr(self.sheets, "append_all_openings_rows", None)
-		append_divider = getattr(self.sheets, "append_iteration_divider_row", None)
-		if callable(append_divider):
-			append_divider(
-				run_iteration=run_iteration,
-				run_timestamp=run_timestamp,
-				run_id=run_id,
-			)
-		if callable(append_all):
-			all_count = int(append_all(all_snapshot_rows + closed_rows))
-			closed_count = len(closed_rows)
+		if callable(replace_active):
+			all_count = int(replace_active(all_snapshot_rows))
+		elif callable(append_all):
+			all_count = int(append_all(all_snapshot_rows))
 
+		append_new_jobs = getattr(self.sheets, "append_new_jobs_rows", None)
 		append_new = getattr(self.sheets, "append_new_openings_rows", None)
-		if callable(append_new):
+		if callable(append_new_jobs):
+			new_count = int(append_new_jobs(delta_rows))
+		elif callable(append_new):
 			new_count = int(append_new(delta_rows))
+
+		append_closed_jobs = getattr(self.sheets, "append_closed_jobs_rows", None)
+		if callable(append_closed_jobs):
+			closed_count = int(append_closed_jobs(closed_rows))
+		else:
+			closed_count = len(closed_rows)
 
 		associate_rows: list[dict] = []
 		for row in delta_rows + closed_rows:
@@ -233,7 +229,28 @@ class SheetWriter:
 			assoc_count = int(append_assoc(associate_rows))
 
 		append_company = getattr(self.sheets, "append_company_opening_rows", None)
-		if callable(append_company):
+		replace_company = getattr(self.sheets, "replace_company_jobs_rows", None)
+		if callable(replace_company):
+			new_hashes = {str(item.get("hash_id") or "") for item in new_jobs}
+			company_snapshot_rows: dict[str, list[dict]] = {name: [] for name in _REQUIRED_COMPANY_SHEETS}
+			for row in all_snapshot_rows:
+				company = str(row.get("company") or "").strip()
+				if not company:
+					continue
+				status = "NEW" if str(row.get("hash_id") or "") in new_hashes else "ACTIVE"
+				company_snapshot_rows.setdefault(company, []).append(
+					{
+						"title": row.get("title") or row.get("role") or "",
+						"location": row.get("location") or "Not Specified",
+						"apply_link": row.get("apply_url") or "",
+						"first_seen": row.get("first_seen") or "",
+						"status": status,
+					}
+				)
+
+			for company, rows in company_snapshot_rows.items():
+				company_count += int(replace_company(company, rows))
+		elif callable(append_company):
 			grouped_company_rows: dict[str, list[dict]] = {}
 			for source_url, jobs in company_jobs.items():
 				rows = [
@@ -274,16 +291,42 @@ class SheetWriter:
 				removed_company = int(result.get("company_rows", 0) or 0)
 				removed_total = int(result.get("total", 0) or 0)
 
-		append_summary = getattr(self.sheets, "append_iteration_summary_row", None)
-		if callable(append_summary):
-			append_summary(
-				run_iteration=run_iteration,
-				run_timestamp=run_timestamp,
-				run_id=run_id,
-				jobs_found=len(active_jobs),
-				new_jobs=len(new_jobs),
-				closed_jobs=len(closed_jobs or []),
-			)
+		replace_all_companies = getattr(self.sheets, "replace_all_companies_rows", None)
+		if callable(replace_all_companies):
+			stats: dict[str, dict[str, Any]] = {}
+			for row in all_snapshot_rows:
+				company = str(row.get("company") or "").strip()
+				if not company:
+					continue
+				entry = stats.setdefault(
+					company,
+					{
+						"company": company,
+						"career_url": str(row.get("source_url") or ""),
+						"active_roles": 0,
+						"new_roles": 0,
+						"last_updated": run_timestamp,
+					},
+				)
+				entry["active_roles"] = int(entry.get("active_roles", 0) or 0) + 1
+
+			for row in delta_rows:
+				company = str(row.get("company") or "").strip()
+				if not company:
+					continue
+				entry = stats.setdefault(
+					company,
+					{
+						"company": company,
+						"career_url": str(row.get("source_url") or ""),
+						"active_roles": 0,
+						"new_roles": 0,
+						"last_updated": run_timestamp,
+					},
+				)
+				entry["new_roles"] = int(entry.get("new_roles", 0) or 0) + 1
+
+			replace_all_companies(list(stats.values()))
 
 		return {
 			"all_openings": all_count,

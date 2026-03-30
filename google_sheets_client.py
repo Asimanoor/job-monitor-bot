@@ -53,7 +53,7 @@ _APPEND_BATCH_SIZE = 50
 # Auto-archive: jobs older than this many days (with non-'New' status) are archived
 AUTO_ARCHIVE_DAYS = 30
 
-URL_CHANGES_WORKSHEET = "URL Changes Log"
+URL_CHANGES_WORKSHEET = "SEARCH_LOG"
 URL_CHANGES_HEADERS = [
     "Timestamp",
     "Career Page URL",
@@ -66,7 +66,7 @@ URL_CHANGES_HEADERS = [
     "Notes",
 ]
 
-CAREER_OPENINGS_WORKSHEET = "Career Openings Log"
+CAREER_OPENINGS_WORKSHEET = "NEW_JOBS"
 CAREER_OPENINGS_HEADERS = [
     "Timestamp",
     "Job Title",
@@ -79,7 +79,7 @@ CAREER_OPENINGS_HEADERS = [
     "Status",
 ]
 
-SEARCH_ACTIVITY_WORKSHEET = "Search Activity Log"
+SEARCH_ACTIVITY_WORKSHEET = "SCRAPER_LOG"
 SEARCH_ACTIVITY_HEADERS = [
     "Timestamp",
     "Run ID",
@@ -118,10 +118,8 @@ ASSOCIATE_ROLES_HEADERS = [
     "Status Color",
 ]
 
-ALL_OPENINGS_WORKSHEET = "All_Openings"
+ALL_OPENINGS_WORKSHEET = "ACTIVE_JOBS"
 ALL_OPENINGS_HEADERS = [
-    "Iteration",
-    "Status",
     "Company",
     "Title",
     "Location",
@@ -129,12 +127,10 @@ ALL_OPENINGS_HEADERS = [
     "URL",
     "First Seen",
     "Last Seen",
-    "Closed Date",
-    "Run ID",
-    "Timestamp",
+    "Status",
 ]
 
-NEW_OPENINGS_WORKSHEET = "New_Openings"
+NEW_OPENINGS_WORKSHEET = "NEW_JOBS"
 NEW_OPENINGS_HEADERS = [
     "Timestamp",
     "Run ID",
@@ -155,6 +151,34 @@ _STATUS_COLORS = {
     "ACTIVE": "#ffffff",
     "CLOSED": "#f4cccc",
 }
+
+CLOSED_JOBS_WORKSHEET = "CLOSED_JOBS"
+ALL_COMPANIES_WORKSHEET = "ALL_COMPANIES"
+
+CLOSED_JOBS_HEADERS = [
+    "Company",
+    "Title",
+    "Location",
+    "URL",
+    "First Seen",
+    "Closed At",
+]
+
+COMPANY_SHEET_HEADERS = [
+    "Title",
+    "Location",
+    "URL",
+    "First Seen",
+    "Status",
+]
+
+ALL_COMPANIES_HEADERS = [
+    "Company",
+    "Career URL",
+    "Active Roles",
+    "New Roles This Run",
+    "Last Updated",
+]
 
 _ITERATION_OLD_ACTIVE_COLOR = "#eeeeee"
 _RUN_DIVIDER_COLOR = "#d9e8fb"
@@ -638,9 +662,6 @@ class GoogleSheetsClient:
 
     @staticmethod
     def _company_opening_row(item: dict) -> list[Any]:
-        ts = item.get("timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        run_id = item.get("run_id") or ""
-        run_iteration = int(item.get("run_iteration", 0) or 0)
         role = item.get("role") or item.get("title") or item.get("job_title") or item.get("position_title") or ""
         company = item.get("company") or item.get("domain") or ""
         location = item.get("location") or "Not Specified"
@@ -649,11 +670,8 @@ class GoogleSheetsClient:
         status = str(item.get("status") or "ACTIVE").upper()
         first_seen = item.get("first_seen") or ""
         last_seen = item.get("last_seen") or ""
-        closed_at = item.get("closed_at") or ""
 
         return [
-            run_iteration,
-            status,
             company,
             role,
             location,
@@ -661,9 +679,24 @@ class GoogleSheetsClient:
             apply_url,
             first_seen,
             last_seen,
-            closed_at,
-            run_id,
-            ts,
+            status,
+        ]
+
+    @staticmethod
+    def _company_tab_title(company_name: str) -> str:
+        raw = str(company_name or "").strip() or "Unknown"
+        cleaned = re.sub(r"[^A-Za-z0-9 _\-]", " ", raw)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip() or "Unknown"
+        return cleaned[:95]
+
+    @staticmethod
+    def _company_sheet_row(item: dict) -> list[Any]:
+        return [
+            item.get("title") or item.get("job_title") or item.get("role") or "",
+            item.get("location") or "Not Specified",
+            item.get("apply_link") or item.get("apply_url") or item.get("url") or "",
+            item.get("first_seen") or "",
+            str(item.get("status") or "ACTIVE").upper(),
         ]
 
     @staticmethod
@@ -787,6 +820,14 @@ class GoogleSheetsClient:
             appended += 1
         return appended
 
+    def _replace_rows(self, ws: Any, headers: list[str], rows: list[list[Any]]) -> int:
+        """Replace worksheet body (keep header), writing rows in one update."""
+        end_col = self._column_letter(len(headers))
+        payload = [headers] + rows
+        self._retry_on_quota(ws.clear)
+        self._retry_on_quota(ws.update, f"A1:{end_col}{len(payload)}", payload)
+        return len(rows)
+
     def _next_append_row_number(self, ws: Any) -> int:
         values = self._retry_on_quota(ws.get_all_values)
         if not isinstance(values, list):
@@ -906,10 +947,8 @@ class GoogleSheetsClient:
             ws = self._get_or_create_worksheet(ALL_OPENINGS_WORKSHEET, ALL_OPENINGS_HEADERS)
             ts = str(run_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
             short_ts = ts.replace(" UTC", "")
-            divider_text = f"===== RUN {int(run_iteration)} | {short_ts} ====="
+            divider_text = f"RUN {int(run_iteration)} | {short_ts}"
             row = [
-                int(run_iteration),
-                "RUN_HEADER",
                 "",
                 divider_text,
                 "",
@@ -917,9 +956,7 @@ class GoogleSheetsClient:
                 "",
                 "",
                 "",
-                "",
-                str(run_id or ""),
-                ts,
+                "RUN_HEADER",
             ]
             return self._append_colored_marker_row(ws, row=row, color=_RUN_DIVIDER_COLOR, headers=ALL_OPENINGS_HEADERS)
         except Exception as exc:
@@ -942,12 +979,10 @@ class GoogleSheetsClient:
             ts = str(run_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
             hhmm = ts[11:16] if len(ts) >= 16 else ts
             summary_text = (
-                f"Jobs Found: {int(jobs_found)} | New Jobs: {int(new_jobs)} | "
-                f"Closed Jobs: {int(closed_jobs)} | Time: {hhmm}"
+                f"RUN_ID {run_id} | TIMESTAMP {hhmm} | TOTAL {int(jobs_found)} | "
+                f"NEW {int(new_jobs)} | CLOSED {int(closed_jobs)}"
             )
             row = [
-                int(run_iteration),
-                "SUMMARY",
                 "",
                 summary_text,
                 "",
@@ -955,9 +990,7 @@ class GoogleSheetsClient:
                 "",
                 "",
                 "",
-                "",
-                str(run_id or ""),
-                ts,
+                "SUMMARY",
             ]
             return self._append_colored_marker_row(ws, row=row, color=_RUN_SUMMARY_COLOR, headers=ALL_OPENINGS_HEADERS)
         except Exception as exc:
@@ -1377,6 +1410,64 @@ class GoogleSheetsClient:
         except Exception as exc:
             log.error("Failed to append search activity rows: %s", exc)
             return 0
+
+    def replace_active_jobs_rows(self, opening_rows: list[dict]) -> int:
+        """Write current ACTIVE snapshot (closed jobs excluded)."""
+        ws = self._get_or_create_worksheet(ALL_OPENINGS_WORKSHEET, ALL_OPENINGS_HEADERS)
+        active_only = [row for row in (opening_rows or []) if str(row.get("status") or "ACTIVE").upper() != "CLOSED"]
+        rows = [self._company_opening_row(item) for item in active_only]
+        return self._replace_rows(ws, ALL_OPENINGS_HEADERS, rows)
+
+    def append_new_jobs_rows(self, opening_rows: list[dict]) -> int:
+        """Append NEW/UPDATED jobs to NEW_JOBS worksheet."""
+        ws = self._get_or_create_worksheet(NEW_OPENINGS_WORKSHEET, NEW_OPENINGS_HEADERS)
+        rows = [
+            self._new_opening_row(item)
+            for item in (opening_rows or [])
+            if str(item.get("status") or "").upper() in {"NEW", "UPDATED", "ACTIVE"}
+        ]
+        return self._append_rows_optimized(ws, rows)
+
+    def append_closed_jobs_rows(self, opening_rows: list[dict]) -> int:
+        """Append CLOSED jobs to CLOSED_JOBS worksheet."""
+        if not opening_rows:
+            return 0
+        ws = self._get_or_create_worksheet(CLOSED_JOBS_WORKSHEET, CLOSED_JOBS_HEADERS)
+        rows: list[list[Any]] = []
+        for item in opening_rows:
+            rows.append(
+                [
+                    item.get("company", ""),
+                    item.get("title") or item.get("job_title") or "",
+                    item.get("location", "Not Specified"),
+                    item.get("apply_link") or item.get("apply_url") or item.get("url") or "",
+                    item.get("first_seen", ""),
+                    item.get("closed_at", ""),
+                ]
+            )
+        return self._append_rows_optimized(ws, rows)
+
+    def replace_company_jobs_rows(self, company_name: str, opening_rows: list[dict]) -> int:
+        """Replace one company worksheet with current snapshot rows."""
+        title = self._company_tab_title(company_name)
+        ws = self._get_or_create_worksheet(title, COMPANY_SHEET_HEADERS)
+        rows = [self._company_sheet_row(item) for item in (opening_rows or [])]
+        return self._replace_rows(ws, COMPANY_SHEET_HEADERS, rows)
+
+    def replace_all_companies_rows(self, company_rows: list[dict]) -> int:
+        """Replace ALL_COMPANIES table each run."""
+        ws = self._get_or_create_worksheet(ALL_COMPANIES_WORKSHEET, ALL_COMPANIES_HEADERS)
+        rows = [
+            [
+                item.get("company", ""),
+                item.get("career_url", ""),
+                int(item.get("active_roles", 0) or 0),
+                int(item.get("new_roles", 0) or 0),
+                item.get("last_updated", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+            ]
+            for item in (company_rows or [])
+        ]
+        return self._replace_rows(ws, ALL_COMPANIES_HEADERS, rows)
 
     def update_job_status(
         self,
