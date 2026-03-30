@@ -1,13 +1,18 @@
 from datetime import datetime, timezone
 
+from classifier import safe_sheet_title_from_url
+from config_loader import ConfigLoader
 from filter_engine import FilterEngine
+from google_sheets_client import GoogleSheetsClient
 from groq_client import GroqClient
 from job_scraper import is_valid_job_posting
 from monitor import (
+    _detect_opening_changes,
     build_jsearch_query_plan,
     extract_company_hints_from_urls,
     run_repeating_pipeline,
 )
+from dedup import normalize_url
 from notification_manager import NotificationManager
 from state_manager import StateManager
 
@@ -196,7 +201,7 @@ def test_record_url_changes_in_sheet_writes_change_and_new_openings():
     assert len(sheets.opening_rows) == 1
     assert sheets.opening_rows[0]["job_title"] == "Junior Software Engineer"
     assert sheets.opening_rows[0]["apply_link"] == "https://example.com/jobs/1"
-    assert sheets.opening_rows[0]["status"] == "New"
+    assert sheets.opening_rows[0]["status"] == "NEW"
 
 
 def test_record_url_changes_in_sheet_logs_baseline_openings_for_new_url():
@@ -433,6 +438,42 @@ def test_record_url_changes_in_sheet_respects_event_and_opening_caps():
     assert sheets.opening_rows[0]["job_title"] == "Junior Software Engineer"
 
 
+def test_record_search_activity_in_sheet_appends_monitor_audit_rows():
+    class DummySheets:
+        def __init__(self):
+            self.activity_rows = []
+
+        def append_search_activity_rows(self, activity_rows: list[dict]) -> int:
+            self.activity_rows.extend(activity_rows)
+            return len(activity_rows)
+
+    sheets = DummySheets()
+    manager = NotificationManager(sheets_client=sheets)
+
+    activity = [
+        {
+            "timestamp": "2026-03-19 17:25:46 UTC",
+            "url": "https://example.com/careers",
+            "domain": "example.com",
+            "status": "content_changed",
+            "change_type": "content_changed",
+            "total_openings": 9,
+            "new_openings_count": 2,
+            "scraper_used": "playwright",
+            "pages_visited": ["https://example.com/careers", "https://jobs.example.com/openings"],
+            "error": "",
+            "notes": "URL monitor cycle audit",
+        }
+    ]
+
+    ok = manager.record_search_activity_in_sheet(activity)
+
+    assert ok is True
+    assert len(sheets.activity_rows) == 1
+    assert sheets.activity_rows[0]["url"] == "https://example.com/careers"
+    assert sheets.activity_rows[0]["new_openings_count"] == 2
+
+
 # ── Role Filter Tests ────────────────────────────────────────────────────────
 
 from role_filter import matches_target_role, filter_jobs_by_role
@@ -463,6 +504,162 @@ def test_role_filter_synonym_match():
     matched, role, score = matches_target_role("ML Engineer", "")
     assert matched is True
     assert role in ["Machine Learning Engineer", "AI Engineer"]
+
+
+def test_google_sheets_primary_dedupe_key_normalizes_tracking_params():
+    token_a = GoogleSheetsClient._build_primary_dedupe_key(
+        {
+            "job_title": "Associate Software Engineer",
+            "company": "Acme",
+            "apply_link": "https://example.com/jobs/123?utm_source=linkedin&ref=abc",
+        }
+    )
+    token_b = GoogleSheetsClient._build_primary_dedupe_key(
+        {
+            "job_title": "Associate Software Engineer",
+            "company": "Acme",
+            "apply_link": "https://example.com/jobs/123?ref=abc&utm_medium=email",
+        }
+    )
+
+    assert token_a == token_b
+
+
+def test_google_sheets_opening_dedupe_key_uses_title_and_apply_link():
+    token_a = GoogleSheetsClient._build_opening_dedupe_key(
+        {
+            "job_title": "Associate AI Engineer",
+            "apply_link": "https://company.test/jobs/ai-1?gclid=123",
+        }
+    )
+    token_b = GoogleSheetsClient._build_opening_dedupe_key(
+        {
+            "job_title": "Associate AI Engineer",
+            "apply_link": "https://company.test/jobs/ai-1",
+        }
+    )
+
+    assert token_a == token_b
+
+
+def test_normalize_url_collapses_trailing_slash_query_and_fragment_variants():
+    a = normalize_url("https://site.com/jobs/")
+    b = normalize_url("https://site.com/jobs?loc=lahore#alljobs")
+    c = normalize_url("https://site.com/jobs")
+
+    assert a == "https://site.com/jobs"
+    assert b == "https://site.com/jobs"
+    assert c == "https://site.com/jobs"
+
+
+def test_config_loader_load_urls_deduplicates_url_variants(tmp_path):
+    links = tmp_path / "links.txt"
+    links.write_text(
+        "\n".join(
+            [
+                "https://venturedive.applytojob.com",
+                "https://venturedive.applytojob.com/#alljobs",
+                "https://venturedive.applytojob.com/?location=lahore",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = ConfigLoader.load_urls(str(links))
+    assert loaded == ["https://venturedive.applytojob.com/"]
+
+
+def test_google_sheets_associate_detection_catches_entry_level_variants():
+    assert GoogleSheetsClient._is_associate_role_title("Associate Software Engineer") is True
+    assert GoogleSheetsClient._is_associate_role_title("Junior Data Scientist") is True
+    assert GoogleSheetsClient._is_associate_role_title("Trainee AI Engineer") is True
+    assert GoogleSheetsClient._is_associate_role_title("Senior Backend Engineer") is False
+
+
+def test_detect_opening_changes_detects_new_and_updated_without_closed_rows():
+    previous = {
+        "url|https://example.com/jobs/1": {
+            "title": "Associate Software Engineer",
+            "company": "Example",
+            "location": "Lahore",
+            "apply_link": "https://example.com/jobs/1",
+            "hash_id": "oldhash-1",
+            "job_key": "url|https://example.com/jobs/1",
+        },
+        "url|https://example.com/jobs/2": {
+            "title": "Junior Data Scientist",
+            "company": "Example",
+            "location": "Remote",
+            "apply_link": "https://example.com/jobs/2",
+            "hash_id": "oldhash-2",
+            "job_key": "url|https://example.com/jobs/2",
+        },
+    }
+
+    current = [
+        {
+            "title": "Associate Software Engineer",
+            "company": "Example",
+            "location": "Remote",  # changed location => UPDATED
+            "apply_link": "https://example.com/jobs/1",
+            "source_url": "https://example.com/careers",
+        },
+        {
+            "title": "Graduate QA Engineer",
+            "company": "Example",
+            "location": "Lahore",
+            "apply_link": "https://example.com/jobs/3",  # NEW
+            "source_url": "https://example.com/careers",
+        },
+    ]
+
+    changes, snapshots, _ = _detect_opening_changes(previous, current)
+    statuses = [item["status"] for item in changes]
+
+    assert "UPDATED" in statuses
+    assert "NEW" in statuses
+    assert len(snapshots) == 2
+
+
+def test_state_manager_missing_count_threshold_controls_deletion(tmp_path):
+    file_path = str(tmp_path / "state.json")
+    mgr = StateManager(filepath=file_path)
+
+    tracked_hash = "hash-abc"
+    current_jobs = {
+        tracked_hash: {
+            "title": "Associate AI Engineer",
+            "company": "Example",
+            "location": "Remote",
+            "apply_link": "https://example.com/jobs/1?utm_source=foo",
+            "source_url": "https://example.com/careers",
+        }
+    }
+
+    deletable_1, skipped_1 = mgr.update_job_hash_state(current_jobs, missing_threshold=2, now_ts="2026-03-30 10:00:00 UTC")
+    assert deletable_1 == []
+    assert skipped_1 == 0
+    assert mgr.get_job_hash_state()[tracked_hash]["status"] == "ACTIVE"
+    assert mgr.get_job_hash_state()[tracked_hash]["missing_count"] == 0
+
+    deletable_2, skipped_2 = mgr.update_job_hash_state({}, missing_threshold=2, now_ts="2026-03-30 16:00:00 UTC")
+    assert deletable_2 == []
+    assert skipped_2 == 1
+    assert mgr.get_job_hash_state()[tracked_hash]["status"] == "MISSING"
+    assert mgr.get_job_hash_state()[tracked_hash]["missing_count"] == 1
+
+    deletable_3, skipped_3 = mgr.update_job_hash_state({}, missing_threshold=2, now_ts="2026-03-30 22:00:00 UTC")
+    assert deletable_3 == [tracked_hash]
+    assert skipped_3 == 0
+    assert tracked_hash in mgr.get_job_hash_state()
+    assert mgr.get_job_hash_state()[tracked_hash]["status"] == "CLOSED"
+    assert mgr.get_job_hash_state()[tracked_hash]["closed_at"] == "2026-03-30 22:00:00 UTC"
+
+
+def test_safe_sheet_title_from_url_is_stable_and_prefixed():
+    title = safe_sheet_title_from_url("https://careers.example.com/jobs/engineering?page=2")
+    assert title.startswith("Company_")
+    assert len(title) <= 95
 
 
 def test_passes_semantic_filter_threshold_true(monkeypatch):
