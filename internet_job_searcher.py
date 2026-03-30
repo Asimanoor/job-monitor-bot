@@ -111,6 +111,27 @@ class InternetJobSearcher:
         cleaned = re.sub(r"\s+", " ", cleaned)
         return cleaned
 
+    @classmethod
+    def _build_company_query_variants(cls, company_name: str) -> list[str]:
+        company = cls._clean_company_query(company_name)
+        return [
+            f'"{company}" careers',
+            f'"{company}" jobs pakistan',
+            f'"{company}" careers lahore',
+            f'"{company}" jobs site:lever.co',
+            f'"{company}" jobs site:greenhouse.io',
+            f'"{company}" jobs site:workday',
+            f'"{company}" jobs site:applytojob.com',
+            f'"{company}" jobs site:workable.com',
+            f'"{company}" associate software engineer',
+            f'"{company}" associate data science',
+            f'"{company}" associate ai engineer',
+            f'"{company}" fresh graduate software engineer',
+            f'"{company}" ai engineer "{company}"',
+            f'"{company}" ai engineer',
+            f'"{company}" machine learning engineer',
+        ]
+
     @staticmethod
     def _normalize_result_url(url: str) -> str:
         raw = (url or "").strip()
@@ -204,12 +225,7 @@ class InternetJobSearcher:
         Search DuckDuckGo for company job openings.
         DuckDuckGo is more accessible than Google for scraping.
         """
-        clean_company = self._clean_company_query(company_name)
-        query_variants = [
-            f'"{clean_company}" careers jobs',
-            f"{clean_company} jobs",
-            f"{clean_company} hiring",
-        ]
+        query_variants = self._build_company_query_variants(company_name)
 
         merged: list[dict[str, str]] = []
         seen: set[str] = set()
@@ -232,53 +248,54 @@ class InternetJobSearcher:
 
     def search_bing(self, company_name: str, max_results: int = 10) -> list[dict[str, str]]:
         """Fallback search path using Bing HTML results."""
-        query = f'"{self._clean_company_query(company_name)}" careers jobs'
         results: list[dict[str, str]] = []
         seen: set[str] = set()
+        queries = self._build_company_query_variants(company_name)
 
-        try:
-            resp = self.session.get(
-                "https://www.bing.com/search",
-                params={"q": query, "setlang": "en-US"},
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.content, "html.parser")
-
-            for card in soup.select("li.b_algo"):
-                if len(results) >= max_results:
-                    break
-
-                link_elem = card.select_one("h2 a")
-                if link_elem is None:
-                    continue
-
-                title = link_elem.get_text(" ", strip=True)
-                href = self._normalize_result_url(str(link_elem.get("href") or ""))
-                if not title or not href:
-                    continue
-
-                snippet_elem = card.select_one("p")
-                snippet = snippet_elem.get_text(" ", strip=True) if snippet_elem else ""
-
-                key = f"{href.lower()}|{title.lower()}"
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                results.append(
-                    {
-                        "title": title,
-                        "url": href,
-                        "snippet": snippet,
-                        "source": "bing",
-                        "query": query,
-                    }
+        for query in queries:
+            if len(results) >= max_results:
+                break
+            try:
+                resp = self.session.get(
+                    "https://www.bing.com/search",
+                    params={"q": query, "setlang": "en-US"},
+                    timeout=self.timeout,
                 )
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.content, "html.parser")
 
-            log.info("Bing: found %d results for '%s'", len(results), company_name)
-        except Exception as exc:
-            log.warning("Bing search failed for '%s': %s", company_name, exc)
+                for card in soup.select("li.b_algo"):
+                    if len(results) >= max_results:
+                        break
+
+                    link_elem = card.select_one("h2 a")
+                    if link_elem is None:
+                        continue
+
+                    title = link_elem.get_text(" ", strip=True)
+                    href = self._normalize_result_url(str(link_elem.get("href") or ""))
+                    if not title or not href:
+                        continue
+
+                    snippet_elem = card.select_one("p")
+                    snippet = snippet_elem.get_text(" ", strip=True) if snippet_elem else ""
+
+                    key = f"{href.lower()}|{title.lower()}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    results.append(
+                        {
+                            "title": title,
+                            "url": href,
+                            "snippet": snippet,
+                            "source": "bing",
+                            "query": query,
+                        }
+                    )
+            except Exception as exc:
+                log.warning("Bing query failed for '%s' (%s): %s", company_name, query, exc)
 
         return results
 
@@ -372,6 +389,7 @@ def search_internet_for_companies(
     max_companies: int = 50,
     max_results_per_company: int = 5,
     timeout_seconds: int = 10,
+    allowed_companies_file: str = "companies_pakistan.txt",
 ) -> list[dict[str, Any]]:
     """
     Search internet for job openings from companies in links.txt.
@@ -400,11 +418,28 @@ def search_internet_for_companies(
     searcher = InternetJobSearcher(timeout_seconds=timeout_seconds)
     deduplicator = JobOpeningDeduplicator()
 
+    allowed_normalized: set[str] = set()
+    if allowed_companies_file and os.path.isfile(allowed_companies_file):
+        try:
+            with open(allowed_companies_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    val = re.sub(r"[^a-z0-9]", "", line.strip().lower())
+                    if val:
+                        allowed_normalized.add(val)
+            log.info("Loaded %d allowed companies from %s", len(allowed_normalized), allowed_companies_file)
+        except Exception as exc:
+            log.warning("Could not read allowed companies file %s: %s", allowed_companies_file, exc)
+
     for idx, company_url in enumerate(links[:max_companies]):
         try:
             company_name = extractor.extract_from_url(company_url)
             if not company_name:
                 log.debug("Could not extract company name from %s", company_url)
+                continue
+
+            company_key = re.sub(r"[^a-z0-9]", "", company_name.strip().lower())
+            if allowed_normalized and company_key not in allowed_normalized:
+                log.debug("Skipping company not in allowed dataset: %s", company_name)
                 continue
 
             if len(company_name) < 2 or len(company_name) > 100:

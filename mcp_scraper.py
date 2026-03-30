@@ -20,6 +20,7 @@ import json
 import logging
 import random
 import re
+import time
 from typing import Any
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
@@ -345,6 +346,40 @@ def _extract_handoff_links(base_url: str, html: str, max_links: int = 6) -> list
     return discovered
 
 
+def _request_with_retries(
+    session: requests.Session,
+    url: str,
+    timeout_seconds: int,
+    max_retries: int = 3,
+) -> requests.Response:
+    """HTTP GET with retry, backoff, and rotating headers for anti-scraping resilience."""
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(max_retries))):
+        headers = {
+            "User-Agent": random.choice(_DEFAULT_USER_AGENTS),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Connection": "keep-alive",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+        try:
+            response = session.get(url, headers=headers, timeout=timeout_seconds, allow_redirects=True)
+            if response.status_code in {403, 429}:
+                raise requests.HTTPError(f"HTTP {response.status_code}", response=response)
+            response.raise_for_status()
+            return response
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 >= max(1, int(max_retries)):
+                break
+            sleep_seconds = min(6.0, (2 ** attempt) + random.uniform(0.1, 0.8))
+            time.sleep(sleep_seconds)
+
+    assert last_exc is not None
+    raise last_exc
+
+
 class LocalPlaywrightScraper:
     """Scrape dynamic pages using a local Chromium browser (headless by default)."""
 
@@ -606,12 +641,6 @@ class RequestsFallbackScraper:
         pages_visited: list[str] = []
         page_title = ""
 
-        headers = {
-            "User-Agent": _DEFAULT_USER_AGENTS[0],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
         while queue and len(pages_visited) < max(1, int(max_pages)):
             target = queue.pop(0)
             token = target.lower().strip()
@@ -620,8 +649,7 @@ class RequestsFallbackScraper:
             seen_pages.add(token)
 
             try:
-                resp = session.get(target, headers=headers, timeout=self.timeout_seconds, allow_redirects=True)
-                resp.raise_for_status()
+                resp = _request_with_retries(session, target, timeout_seconds=self.timeout_seconds, max_retries=3)
                 final_url = str(resp.url or target)
                 html = resp.text or ""
             except Exception:
@@ -683,12 +711,6 @@ class LangchainCareerScraper:
         pages_visited: list[str] = []
         page_title = ""
 
-        headers = {
-            "User-Agent": _DEFAULT_USER_AGENTS[0],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
         while queue and len(pages_visited) < max(1, int(max_pages)):
             target = queue.pop(0)
             token = target.lower().strip()
@@ -697,8 +719,7 @@ class LangchainCareerScraper:
             seen_pages.add(token)
 
             try:
-                resp = session.get(target, headers=headers, timeout=self.timeout_seconds, allow_redirects=True)
-                resp.raise_for_status()
+                resp = _request_with_retries(session, target, timeout_seconds=self.timeout_seconds, max_retries=3)
                 final_url = str(resp.url or target)
                 html = resp.text or ""
             except Exception:
@@ -766,12 +787,6 @@ class CrewAICareerScraper:
         aggregated: list[dict[str, str]] = []
         page_title = ""
 
-        headers = {
-            "User-Agent": _DEFAULT_USER_AGENTS[0],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-
         while queue and len(seen_pages) < max(1, int(max_pages)):
             target = queue.pop(0)
             token = target.lower().strip()
@@ -780,8 +795,7 @@ class CrewAICareerScraper:
             seen_pages.add(token)
 
             try:
-                resp = session.get(target, headers=headers, timeout=self.timeout_seconds, allow_redirects=True)
-                resp.raise_for_status()
+                resp = _request_with_retries(session, target, timeout_seconds=self.timeout_seconds, max_retries=3)
                 final_url = str(resp.url or target)
                 html = resp.text or ""
             except Exception:

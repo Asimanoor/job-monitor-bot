@@ -1,4 +1,4 @@
-# 🎯 Job Monitor Bot
+# Job Monitor Bot
 
 Automated job monitoring system for fresh CS graduates. It watches `links.txt` career pages, extracts job-only postings, filters by role (keyword + optional semantic), and logs all findings to **Google Sheets**. Additionally, the bot searches the internet for job openings from companies in `links.txt`.
 
@@ -30,7 +30,11 @@ Automated job monitoring system for fresh CS graduates. It watches `links.txt` c
                         ▼
        ┌────────────────────────────────┐
        │ Google Sheets Logger           │
-       │ (Audit + Openings Logs)        │
+       │ (Audit + Change Logs)          │
+       │ • All_Openings                 │
+       │ • New_Openings                 │
+       │ • Associate_Roles              │
+       │ • Company_<per-link> sheets    │
        │ • URL Changes Log              │
        │ • Career Openings Log          │
        │ • Search Activity Log          │
@@ -52,6 +56,12 @@ Automated job monitoring system for fresh CS graduates. It watches `links.txt` c
 | `internet_job_searcher.py` | Internet search for job openings from companies in links.txt |
 | `job_extractor.py` | Job-only extraction + job-detail description enrichment |
 | `google_sheets_client.py` | Google Sheets CRUD + career openings log |
+| `dedup.py` | URL normalization + SHA256 hash keys for dedupe/change detection |
+| `classifier.py` | Associate-role classifier + company sheet-name helper |
+| `pagination.py` | Pagination pattern helpers (`page`, `offset`, `cursor`) |
+| `scraper.py` | Compatibility wrapper exposing multi-strategy scraper |
+| `sheet_writer.py` | Compatibility wrapper exposing GoogleSheets client |
+| `main.py` | Lightweight entrypoint wrapper for `monitor.main()` |
 | `email_notifier.py` | Gmail SMTP with rate limiting (optional fallback) |
 | `email_templates.py` | Responsive HTML templates (FAST NUCES branding) |
 | `notification_manager.py` | Channel management: Google Sheets → Email → JSON |
@@ -120,10 +130,16 @@ HF_TOKEN=optional_huggingface_token
 2. Add it as GitHub Secret: `GOOGLE_CREDENTIALS_JSON`
 3. Follow [sheet_setup_guide.md](sheet_setup_guide.md) for formatting
 4. Follow [EMAIL_SETUP.md](EMAIL_SETUP.md) for Gmail App Password
-5. On first URL-change run, the bot auto-creates two extra worksheets:
+5. On first URL-change run, the bot auto-creates these worksheets:
+       - `All_Openings` (append-only NEW/UPDATED/CLOSED history)
+       - `New_Openings` (append-only NEW/UPDATED only)
+       - `Associate Roles` (associate/junior/trainee/graduate/entry-level openings)
+       - `Company_<url>` (one worksheet per `links.txt` URL with full change history)
        - `URL Changes Log` (every detected career-page change)
        - `Career Openings Log` (detected opening title + opening link)
        - `Search Activity Log` (per-URL scan outcome: searched/changed/ignored/error)
+
+All sheet writes now use dedupe keys (normalized URL + hash-based keys), so duplicate rows are skipped automatically across repeated 6-hour runs.
 
 ### 4. Run
 

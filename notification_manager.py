@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+from classifier import is_associate_role, normalize_company_name
+from dedup import build_job_hash, normalize_url
 from job_scraper import is_valid_job_posting
 from role_filter import matches_target_role
 
@@ -39,6 +41,11 @@ class SheetsClient(Protocol):
     def append_url_change_rows(self, change_rows: list[dict]) -> int: ...
     def append_career_opening_rows(self, opening_rows: list[dict]) -> int: ...
     def append_search_activity_rows(self, activity_rows: list[dict]) -> int: ...
+    def append_associate_opening_row(self, opening_data: dict) -> bool: ...
+    def append_associate_opening_rows(self, opening_rows: list[dict]) -> int: ...
+    def append_all_openings_rows(self, opening_rows: list[dict]) -> int: ...
+    def append_new_openings_rows(self, opening_rows: list[dict]) -> int: ...
+    def append_company_opening_rows(self, source_url: str, opening_rows: list[dict]) -> int: ...
     def update_job_status(self, job_apply_link: str,
                           new_status: str, notes: str = "") -> bool: ...
 
@@ -178,6 +185,7 @@ class NotificationManager:
 
                 openings = item.get("openings") if isinstance(item.get("openings"), list) else []
                 new_openings = item.get("new_openings") if isinstance(item.get("new_openings"), list) else []
+                opening_changes = item.get("opening_changes") if isinstance(item.get("opening_changes"), list) else []
 
                 events.append(
                     {
@@ -188,8 +196,10 @@ class NotificationManager:
                         "scraper_used": str(item.get("scraper_used") or "unknown"),
                         "openings": openings,
                         "new_openings": new_openings,
+                        "opening_changes": opening_changes,
                         "total_openings": int(item.get("total_openings") or len(openings)),
                         "new_openings_count": int(item.get("new_openings_count") or len(new_openings)),
+                        "opening_changes_count": int(item.get("opening_changes_count") or len(opening_changes)),
                     }
                 )
 
@@ -283,19 +293,8 @@ class NotificationManager:
         if not events:
             return True
 
-        lines: list[str] = []
-        sample_positions: list[str] = []
-
         for event in events[: self._url_change_alert_max_events]:
             url = str(event.get("url", ""))
-            change_type = str(event.get("change_type", "content_changed"))
-            total = int(event.get("total_openings", 0) or 0)
-            new_count = int(event.get("new_openings_count", 0) or 0)
-
-            if new_count > 0:
-                lines.append(f"• {url} (new openings: {new_count}, detected: {total})")
-            else:
-                lines.append(f"• {url} ({change_type})")
 
             new_openings = event.get("new_openings") if isinstance(event.get("new_openings"), list) else []
             for opening in new_openings[:2]:
@@ -314,7 +313,6 @@ class NotificationManager:
                         matched, _role, _score = matches_target_role(title, description="")
                         if not matched:
                             continue
-                        sample_positions.append(f"• {title} — {link}")
 
         # URL changes are logged to Google Sheets only (no Telegram alerts)
         # Proceed to record_url_changes_in_sheet()
@@ -336,6 +334,8 @@ class NotificationManager:
 
         change_payloads: list[dict[str, Any]] = []
         opening_payloads: list[dict[str, Any]] = []
+        associate_payloads: list[dict[str, Any]] = []
+        company_grouped_payloads: dict[str, list[dict[str, Any]]] = {}
         global_seen_tokens: set[str] = set()
         remaining_opening_budget = self._url_change_max_openings_per_cycle
 
@@ -349,6 +349,7 @@ class NotificationManager:
 
             new_openings = event.get("new_openings") if isinstance(event.get("new_openings"), list) else []
             all_openings = event.get("openings") if isinstance(event.get("openings"), list) else []
+            opening_changes = event.get("opening_changes") if isinstance(event.get("opening_changes"), list) else []
             total_openings = int(event.get("total_openings", len(all_openings)) or 0)
             new_openings_count = int(event.get("new_openings_count", len(new_openings)) or 0)
 
@@ -366,13 +367,34 @@ class NotificationManager:
                         for opening in new_openings[:5]
                         if isinstance(opening, dict)
                     ],
-                    "notes": f"Job-only monitor (source=links.txt, scraper={scraper_used}, cap={self._url_change_max_openings_per_event}/event)",
+                    "notes": f"Job monitor (source=links.txt, scraper={scraper_used}, cap={self._url_change_max_openings_per_event}/event)",
                 }
             )
 
-            openings_to_log = new_openings if new_openings else (
-                all_openings if (change_type == "new_url_tracked" and self._url_change_log_baseline_openings) else []
-            )
+            if opening_changes:
+                openings_to_log = [item for item in opening_changes if isinstance(item, dict)]
+            else:
+                baseline = new_openings if new_openings else (
+                    all_openings if (change_type == "new_url_tracked" and self._url_change_log_baseline_openings) else []
+                )
+                openings_to_log = []
+                for opening in baseline:
+                    if not isinstance(opening, dict):
+                        continue
+                    openings_to_log.append(
+                        {
+                            "title": opening.get("title", ""),
+                            "apply_link": opening.get("link", ""),
+                            "location": opening.get("location", "Not Specified"),
+                            "company": opening.get("company") or domain,
+                            "category": opening.get("category") or "Not Specified",
+                            "experience": opening.get("experience") or "Not Specified",
+                            "job_type": opening.get("type") or opening.get("job_type") or "Not Specified",
+                            "source_url": url,
+                            "status": "NEW",
+                        }
+                    )
+
             openings_to_log = openings_to_log[: self._url_change_max_openings_per_event]
 
             if remaining_opening_budget <= 0:
@@ -387,46 +409,84 @@ class NotificationManager:
                 if not isinstance(opening, dict):
                     continue
 
-                opening_title = str(opening.get("title", "")).strip()
-                opening_link = str(opening.get("link", "")).strip()
+                opening_title = str(opening.get("title") or opening.get("job_title") or "").strip()
+                opening_link = str(opening.get("apply_link") or opening.get("link") or opening.get("apply_url") or "").strip()
+                status = str(opening.get("status") or "NEW").upper()
                 job_payload = {
                     "title": opening_title,
-                    "company": domain,
-                    "location": str(opening.get("location", "")).strip(),
-                    "type": str(opening.get("type", "")).strip(),
+                    "company": normalize_company_name(str(opening.get("company") or domain), fallback_url=url),
+                    "location": str(opening.get("location", "Not Specified")).strip() or "Not Specified",
+                    "category": str(opening.get("category", "Not Specified")).strip() or "Not Specified",
+                    "experience": str(opening.get("experience", "Not Specified")).strip() or "Not Specified",
+                    "job_type": str(opening.get("job_type") or opening.get("type") or "Not Specified").strip() or "Not Specified",
                     "apply_link": opening_link,
                     "posted_date": str(opening.get("posted_date", "")).strip(),
                     "source_url": url,
                     "job_url": opening_link,
+                    "status": status,
                 }
 
                 if not is_valid_job_posting(job_payload):
                     continue
 
                 # Apply role filtering — only log openings matching target roles
-                matched, _, _ = matches_target_role(opening_title)
+                matched, matched_role, _ = matches_target_role(opening_title)
                 if not matched:
                     continue
 
-                token = f"{job_payload['title'].lower()}|{job_payload['apply_link'].lower()}"
+                hash_id = str(opening.get("hash_id") or "") or build_job_hash(
+                    job_payload["company"],
+                    job_payload["title"],
+                    job_payload["location"],
+                    job_payload["apply_link"],
+                )
+                token = f"{status}|{hash_id}|{normalize_url(job_payload['apply_link'])}"
                 if token in seen_tokens or token in global_seen_tokens:
                     continue
                 seen_tokens.add(token)
                 global_seen_tokens.add(token)
 
-                opening_payloads.append(
-                    {
-                        "timestamp": now,
-                        "job_title": job_payload["title"],
-                        "company": job_payload["company"],
-                        "location": job_payload["location"],
-                        "type": job_payload["type"],
-                        "apply_link": job_payload["apply_link"],
-                        "posted_date": job_payload["posted_date"],
-                        "source_url": job_payload["source_url"],
-                        "status": "New" if opening in new_openings else "Tracked",
-                    }
-                )
+                opening_row = {
+                    "timestamp": now,
+                    "role": job_payload["title"],
+                    "job_title": job_payload["title"],
+                    "company": job_payload["company"],
+                    "location": job_payload["location"],
+                    "category": job_payload["category"],
+                    "experience": job_payload["experience"],
+                    "job_type": job_payload["job_type"],
+                    "type": job_payload["job_type"],
+                    "apply_url": job_payload["apply_link"],
+                    "apply_link": job_payload["apply_link"],
+                    "source_url": job_payload["source_url"],
+                    "status": status,
+                    "hash_id": hash_id,
+                    "matched_role": matched_role or "",
+                }
+                opening_payloads.append(opening_row)
+                company_grouped_payloads.setdefault(url, []).append(opening_row)
+
+                if is_associate_role(
+                    opening_row["job_title"],
+                    description=str(opening.get("description") or ""),
+                    department=str(opening.get("category") or ""),
+                ):
+                    associate_payloads.append(
+                        {
+                            "timestamp": now,
+                            "job_title": opening_row["job_title"],
+                            "company": opening_row["company"],
+                            "location": opening_row["location"],
+                            "type": opening_row["job_type"],
+                            "apply_link": opening_row["apply_link"],
+                            "posted_date": job_payload["posted_date"],
+                            "source_url": opening_row["source_url"],
+                            "matched_role": opening_row["matched_role"],
+                            "status": opening_row["status"],
+                            "notes": "Associate-role classifier",
+                            "hash_id": opening_row["hash_id"],
+                        }
+                    )
 
         appended_changes = 0
         append_change_rows_fn = getattr(self._sheets, "append_url_change_rows", None)
@@ -463,16 +523,63 @@ class NotificationManager:
                     len(opening_payloads),
                 )
 
+        appended_all_openings = 0
+        append_all_openings_fn = getattr(self._sheets, "append_all_openings_rows", None)
+        if callable(append_all_openings_fn):
+            try:
+                appended_all_openings = int(append_all_openings_fn(opening_payloads))
+            except Exception as exc:
+                log.warning("All_Openings append failed: %s", exc)
+
+        appended_new_openings = 0
+        append_new_openings_fn = getattr(self._sheets, "append_new_openings_rows", None)
+        if callable(append_new_openings_fn):
+            try:
+                appended_new_openings = int(append_new_openings_fn(opening_payloads))
+            except Exception as exc:
+                log.warning("New_Openings append failed: %s", exc)
+
+        appended_associate = 0
+        append_associate_rows_fn = getattr(self._sheets, "append_associate_opening_rows", None)
+        if callable(append_associate_rows_fn):
+            try:
+                appended_associate = int(append_associate_rows_fn(associate_payloads))
+            except Exception as exc:
+                log.warning("Associate_Roles append failed: %s", exc)
+
+        appended_company_total = 0
+        append_company_fn = getattr(self._sheets, "append_company_opening_rows", None)
+        if callable(append_company_fn):
+            for source_url, grouped_rows in company_grouped_payloads.items():
+                try:
+                    appended_company_total += int(append_company_fn(source_url, grouped_rows))
+                except Exception as exc:
+                    log.warning("Company sheet append failed for %s: %s", source_url, exc)
+
         if appended_changes < len(change_payloads):
             log.warning("Sheets URL change logging partial success: %d/%d", appended_changes, len(change_payloads))
 
         log.info(
-            "Sheets URL logging summary: change rows=%d/%d, validated opening rows=%d",
+            "Sheets URL logging summary: change rows=%d/%d, openings=%d, all_openings=%d, new_openings=%d, associate=%d, company_rows=%d",
             appended_changes,
             len(change_payloads),
             appended_openings,
+            appended_all_openings,
+            appended_new_openings,
+            appended_associate,
+            appended_company_total,
         )
-        return appended_openings > 0 or appended_changes > 0
+        return any(
+            value > 0
+            for value in (
+                appended_openings,
+                appended_changes,
+                appended_all_openings,
+                appended_new_openings,
+                appended_associate,
+                appended_company_total,
+            )
+        )
 
     def record_search_activity_in_sheet(self, activity_rows: list[dict[str, Any]]) -> bool:
         """Persist per-URL monitor activity (searched/changed/ignored/error) for full audit history."""
@@ -491,6 +598,8 @@ class NotificationManager:
             payloads.append(
                 {
                     "timestamp": str(row.get("timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+                    "run_id": str(row.get("run_id") or ""),
+                    "run_iteration": int(row.get("run_iteration", 0) or 0),
                     "url": url,
                     "domain": str(row.get("domain") or urlparse(url).netloc or ""),
                     "status": str(row.get("status") or ""),

@@ -3,6 +3,8 @@ import logging
 import os
 from pathlib import Path
 
+from dedup import normalize_url
+
 log = logging.getLogger(__name__)
 
 
@@ -57,6 +59,14 @@ class ConfigLoader:
             "record_search_activity_to_sheets": True,
             "url_monitor_async_concurrency": 4,
             "jsearch_async_concurrency": 1,
+            "remove_closed_rows": True,
+            # Keep append-only history in All_Openings/company sheets by default.
+            # When true, closed jobs are written as CLOSED rows instead of deleting history rows.
+            "append_only_openings_history": True,
+            "closed_missing_threshold": 2,
+            "max_jobs_per_site": 50,
+            "state_closed_cleanup_days": 30,
+            "scraper_timeout_seconds": 15,
             # How many matched jobs to enrich with full description per run
             "job_details_max_per_cycle": 20,
             # Minimum description length required to consider extraction valid
@@ -256,6 +266,34 @@ class ConfigLoader:
                 self.config["jsearch_async_concurrency"] = int(os.environ["JSEARCH_ASYNC_CONCURRENCY"])
             except ValueError:
                 pass
+        if "REMOVE_CLOSED_ROWS" in os.environ:
+            self.config["remove_closed_rows"] = os.environ["REMOVE_CLOSED_ROWS"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "APPEND_ONLY_OPENINGS_HISTORY" in os.environ:
+            self.config["append_only_openings_history"] = os.environ["APPEND_ONLY_OPENINGS_HISTORY"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "CLOSED_MISSING_THRESHOLD" in os.environ:
+            try:
+                self.config["closed_missing_threshold"] = int(os.environ["CLOSED_MISSING_THRESHOLD"])
+            except ValueError:
+                pass
+        if "MAX_JOBS_PER_SITE" in os.environ:
+            try:
+                self.config["max_jobs_per_site"] = int(os.environ["MAX_JOBS_PER_SITE"])
+            except ValueError:
+                pass
+        if "STATE_CLOSED_CLEANUP_DAYS" in os.environ:
+            try:
+                self.config["state_closed_cleanup_days"] = int(os.environ["STATE_CLOSED_CLEANUP_DAYS"])
+            except ValueError:
+                pass
+        if "SCRAPER_TIMEOUT_SECONDS" in os.environ:
+            try:
+                self.config["scraper_timeout_seconds"] = int(os.environ["SCRAPER_TIMEOUT_SECONDS"])
+            except ValueError:
+                pass
 
     def get(self, key: str, default=None):
         return self.config.get(key, default)
@@ -303,9 +341,15 @@ class ConfigLoader:
     def load_urls(cls, filepath: str = "links.txt") -> list[str]:
         raw = cls.load_lines(filepath)
         urls: list[str] = []
+        seen: set[str] = set()
         for line in raw:
             if line.startswith(("http://", "https://")):
-                urls.append(line)
+                canonical = normalize_url(line)
+                if canonical and canonical in seen:
+                    log.info("Skipping duplicate URL variant: %s", line)
+                    continue
+                seen.add(canonical)
+                urls.append(canonical or line)
             else:
                 log.warning("Skipping invalid URL: %s", line)
         log.info("Loaded %d URLs from %s", len(urls), filepath)

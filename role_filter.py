@@ -196,6 +196,15 @@ def is_senior_role(title: str, description: str = "") -> bool:
     """Return True if the role is senior-level (should be excluded for entry-level search)."""
     title_lower = title.lower()
 
+    # Robust title seniority detection (handles 'Sr.', 'Sr ', and common leadership labels).
+    if re.search(
+        r"\b(senior|sr\.?|lead|principal|staff|director|head|vp|vice president|chief|cto|cio|cfo)\b",
+        title_lower,
+    ):
+        if _word_boundary_match(title, ENTRY_LEVEL_HINTS):
+            return False
+        return True
+
     # Check title
     for kw in SENIOR_TITLE_KEYWORDS:
         pattern = r"\b" + re.escape(kw.lower()) + r"\b"

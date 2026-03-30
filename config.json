@@ -39,5 +39,8 @@
     "record_url_changes_to_sheets": true,
     "record_search_activity_to_sheets": true,
     "url_monitor_async_concurrency": 4,
-    "jsearch_async_concurrency": 1
+    "jsearch_async_concurrency": 1,
+    "remove_closed_rows": true,
+    "append_only_openings_history": true,
+    "closed_missing_threshold": 2
 }

@@ -26,11 +26,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import gspread
+from classifier import safe_sheet_title_from_url
+from dedup import build_job_hash, normalize_location, normalize_title, normalize_url
 from google.oauth2.service_account import Credentials
 
 log = logging.getLogger(__name__)
@@ -78,6 +82,8 @@ CAREER_OPENINGS_HEADERS = [
 SEARCH_ACTIVITY_WORKSHEET = "Search Activity Log"
 SEARCH_ACTIVITY_HEADERS = [
     "Timestamp",
+    "Run ID",
+    "Run Iteration",
     "Career Page URL",
     "Domain",
     "Status",
@@ -89,6 +95,91 @@ SEARCH_ACTIVITY_HEADERS = [
     "Error",
     "Notes",
 ]
+
+ASSOCIATE_ROLES_WORKSHEET = "Associate Roles"
+ASSOCIATE_ROLES_HEADERS = [
+    "Timestamp",
+    "Run ID",
+    "Run Iteration",
+    "Job Title",
+    "Company",
+    "Location",
+    "Type",
+    "Apply Link",
+    "Posted Date",
+    "Source URL",
+    "Matched Role",
+    "Status",
+    "Notes",
+    "Hash ID",
+    "First Seen",
+    "Last Seen",
+    "Closed Date",
+    "Status Color",
+]
+
+ALL_OPENINGS_WORKSHEET = "All_Openings"
+ALL_OPENINGS_HEADERS = [
+    "Iteration",
+    "Status",
+    "Company",
+    "Title",
+    "Location",
+    "Experience",
+    "URL",
+    "First Seen",
+    "Last Seen",
+    "Closed Date",
+    "Run ID",
+    "Timestamp",
+]
+
+NEW_OPENINGS_WORKSHEET = "New_Openings"
+NEW_OPENINGS_HEADERS = [
+    "Timestamp",
+    "Run ID",
+    "Run Iteration",
+    "Company",
+    "Role",
+    "Location",
+    "Apply URL",
+    "Status",
+    "Hash ID",
+    "Status Color",
+]
+
+_STATUS_COLORS = {
+    "NEW": "#d9ead3",
+    "UPDATED": "#eeeeee",
+    "EXISTING": "#ffffff",
+    "ACTIVE": "#ffffff",
+    "CLOSED": "#f4cccc",
+}
+
+_ITERATION_OLD_ACTIVE_COLOR = "#eeeeee"
+_RUN_DIVIDER_COLOR = "#d9e8fb"
+_RUN_SUMMARY_COLOR = "#fff2cc"
+
+_TRACKING_QUERY_PREFIXES = (
+    "utm_",
+    "fbclid",
+    "gclid",
+    "mc_",
+    "hs",
+    "__hs",
+)
+
+_ASSOCIATE_KEYWORDS = (
+    "associate",
+    "junior",
+    "graduate",
+    "trainee",
+    "entry",
+    "entry-level",
+    "intern",
+    "fresher",
+    "new grad",
+)
 
 
 class GoogleSheetsClient:
@@ -148,6 +239,11 @@ class GoogleSheetsClient:
         self._worksheet_cache: dict[str, Any] = {self._ws.title: self._ws}
         self._header_initialized: set[str] = set()
         self._primary_header_checked = False
+        self._primary_dedupe_cache: set[str] | None = None
+        self._career_opening_dedupe_cache: set[str] | None = None
+        self._associate_dedupe_cache: set[str] | None = None
+        self._worksheet_dedupe_caches: dict[str, set[str]] = {}
+        self._status_formatting_applied: set[str] = set()
         log.info(
             "GoogleSheetsClient ready — sheet '%s' (%s), worksheet '%s'",
             self._spreadsheet.title, sheet_id, self._ws.title,
@@ -200,8 +296,10 @@ class GoogleSheetsClient:
         """Fetch worksheet by title or create it, then enforce header row."""
         cached = self._worksheet_cache.get(title)
         if cached is not None:
+            self._ensure_status_conditional_formatting(cached, headers)
             return cached
 
+        created = False
         try:
             ws = self._spreadsheet.worksheet(title)
         except gspread.exceptions.WorksheetNotFound:
@@ -210,6 +308,7 @@ class GoogleSheetsClient:
                 rows=max(rows, 100),
                 cols=max(len(headers), 9),
             )
+            created = True
 
         if title not in self._header_initialized:
             end_col = self._column_letter(len(headers))
@@ -217,8 +316,374 @@ class GoogleSheetsClient:
             self._header_initialized.add(title)
 
         self._worksheet_cache[title] = ws
+        if created or title not in self._status_formatting_applied:
+            self._ensure_status_conditional_formatting(ws, headers)
 
         return ws
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        return " ".join(str(value or "").strip().lower().split())
+
+    @staticmethod
+    def _status_color(status: str) -> str:
+        return _STATUS_COLORS.get(str(status or "").upper(), "#ffffff")
+
+    @staticmethod
+    def _hex_to_rgb_components(hex_color: str) -> tuple[float, float, float]:
+        raw = str(hex_color or "").strip().lstrip("#")
+        if len(raw) != 6:
+            return (1.0, 1.0, 1.0)
+        try:
+            r = int(raw[0:2], 16) / 255.0
+            g = int(raw[2:4], 16) / 255.0
+            b = int(raw[4:6], 16) / 255.0
+            return (r, g, b)
+        except Exception:
+            return (1.0, 1.0, 1.0)
+
+    def _ensure_status_conditional_formatting(self, ws: Any, headers: list[str]) -> None:
+        """Apply status-based row color rules once per worksheet.
+
+        Non-fatal by design: if formatting fails, row writes continue.
+        """
+        title = str(getattr(ws, "title", "") or "").strip()
+        if not title or title in self._status_formatting_applied:
+            return
+
+        status_col_idx = None
+        iteration_col_idx = None
+        for idx, header in enumerate(headers, start=1):
+            header_norm = str(header or "").strip().lower()
+            if header_norm == "status":
+                status_col_idx = idx
+            elif header_norm == "iteration":
+                iteration_col_idx = idx
+        if status_col_idx is None:
+            self._status_formatting_applied.add(title)
+            return
+
+        status_col_letter = self._column_letter(status_col_idx)
+        iteration_col_letter = self._column_letter(iteration_col_idx) if iteration_col_idx else ""
+        total_columns = max(1, len(headers))
+
+        try:
+            metadata = self._retry_on_quota(self._spreadsheet.fetch_sheet_metadata)
+            existing_formulas: set[str] = set()
+            if isinstance(metadata, dict):
+                for sheet_meta in metadata.get("sheets", []):
+                    props = sheet_meta.get("properties") if isinstance(sheet_meta, dict) else {}
+                    if not isinstance(props, dict) or int(props.get("sheetId", -1)) != int(ws.id):
+                        continue
+                    conditional_rules = sheet_meta.get("conditionalFormats") if isinstance(sheet_meta, dict) else []
+                    if not isinstance(conditional_rules, list):
+                        continue
+                    for rule in conditional_rules:
+                        if not isinstance(rule, dict):
+                            continue
+                        boolean_rule = rule.get("booleanRule") if isinstance(rule.get("booleanRule"), dict) else {}
+                        condition = boolean_rule.get("condition") if isinstance(boolean_rule.get("condition"), dict) else {}
+                        if str(condition.get("type") or "") != "CUSTOM_FORMULA":
+                            continue
+                        values = condition.get("values") if isinstance(condition.get("values"), list) else []
+                        if not values:
+                            continue
+                        user_formula = ""
+                        first = values[0]
+                        if isinstance(first, dict):
+                            user_formula = str(first.get("userEnteredValue") or "").strip()
+                        if user_formula:
+                            existing_formulas.add(user_formula)
+
+            if iteration_col_idx is not None:
+                formula_color_pairs = [
+                    (f'=${status_col_letter}2="NEW"', _STATUS_COLORS["NEW"]),
+                    (f'=${status_col_letter}2="CLOSED"', _STATUS_COLORS["CLOSED"]),
+                    (
+                        f'=AND(${status_col_letter}2="ACTIVE",${iteration_col_letter}2<MAX(${iteration_col_letter}:${iteration_col_letter}))',
+                        _ITERATION_OLD_ACTIVE_COLOR,
+                    ),
+                ]
+            else:
+                formula_color_pairs = [
+                    (f'=${status_col_letter}2="{status}"', hex_color)
+                    for status, hex_color in _STATUS_COLORS.items()
+                ]
+
+            requests_payload: list[dict[str, Any]] = []
+            insert_index = len(existing_formulas)
+            for formula, hex_color in formula_color_pairs:
+                if formula in existing_formulas:
+                    continue
+                r, g, b = self._hex_to_rgb_components(hex_color)
+                requests_payload.append(
+                    {
+                        "addConditionalFormatRule": {
+                            "rule": {
+                                "ranges": [
+                                    {
+                                        "sheetId": ws.id,
+                                        "startRowIndex": 1,
+                                        "startColumnIndex": 0,
+                                        "endColumnIndex": total_columns,
+                                    }
+                                ],
+                                "booleanRule": {
+                                    "condition": {
+                                        "type": "CUSTOM_FORMULA",
+                                        "values": [{"userEnteredValue": formula}],
+                                    },
+                                    "format": {
+                                        "backgroundColor": {
+                                            "red": r,
+                                            "green": g,
+                                            "blue": b,
+                                        }
+                                    },
+                                },
+                            },
+                            "index": insert_index,
+                        }
+                    }
+                )
+                insert_index += 1
+
+            if requests_payload:
+                self._retry_on_quota(self._spreadsheet.batch_update, {"requests": requests_payload})
+        except Exception as exc:
+            log.warning("Could not apply status formatting for worksheet '%s': %s", title, exc)
+
+        self._status_formatting_applied.add(title)
+
+    @staticmethod
+    def _normalize_url(value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"}:
+            return raw.lower()
+
+        filtered_query: list[tuple[str, str]] = []
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True):
+            key_l = (key or "").lower()
+            if key_l.startswith(_TRACKING_QUERY_PREFIXES):
+                continue
+            filtered_query.append((key, item))
+
+        normalized_path = re.sub(r"/+", "/", parsed.path or "/")
+        query = urlencode(filtered_query, doseq=True)
+        return urlunparse(
+            (
+                parsed.scheme.lower(),
+                (parsed.netloc or "").lower(),
+                normalized_path,
+                parsed.params,
+                query,
+                "",
+            )
+        )
+
+    @classmethod
+    def _build_primary_dedupe_key(cls, row_data: dict) -> str:
+        apply_link = cls._normalize_url(row_data.get("apply_link", ""))
+        if apply_link:
+            return f"link|{apply_link}"
+
+        title = cls._normalize_text(row_data.get("job_title", ""))
+        company = cls._normalize_text(row_data.get("company", ""))
+        if title or company:
+            return f"title_company|{title}|{company}"
+        return ""
+
+    @classmethod
+    def _build_opening_dedupe_key(cls, row_data: dict) -> str:
+        apply_link = cls._normalize_url(
+            row_data.get("apply_link") or row_data.get("position_link") or ""
+        )
+        title_raw = row_data.get("job_title") or row_data.get("position_title") or ""
+        title = normalize_title(str(title_raw or ""))
+        company = cls._normalize_text(row_data.get("company") or row_data.get("domain") or "")
+        location = normalize_location(str(row_data.get("location") or ""), fallback_url=apply_link)
+
+        fingerprint = f"fp|{company}|{title}|{location}"
+        if apply_link:
+            return f"title_link|{fingerprint}|{apply_link}"
+        if title:
+            return f"title_only|{fingerprint}"
+        return ""
+
+    @classmethod
+    def _is_associate_role_title(cls, title: str) -> bool:
+        title_norm = cls._normalize_text(title)
+        return any(keyword in title_norm for keyword in _ASSOCIATE_KEYWORDS)
+
+    def _hydrate_primary_dedupe_cache(self) -> set[str]:
+        if self._primary_dedupe_cache is not None:
+            return self._primary_dedupe_cache
+
+        tokens: set[str] = set()
+        try:
+            all_rows = self._retry_on_quota(self._ws.get_all_records)
+            if isinstance(all_rows, list):
+                for record in all_rows:
+                    if not isinstance(record, dict):
+                        continue
+                    token = self._build_primary_dedupe_key(
+                        {
+                            "apply_link": record.get("Apply Link", ""),
+                            "job_title": record.get("Job Title", ""),
+                            "company": record.get("Company", ""),
+                        }
+                    )
+                    if token:
+                        tokens.add(token)
+        except Exception as exc:
+            log.warning("Could not hydrate primary dedupe cache: %s", exc)
+
+        self._primary_dedupe_cache = tokens
+        return tokens
+
+    def _hydrate_career_opening_dedupe_cache(self, ws: Any) -> set[str]:
+        if self._career_opening_dedupe_cache is not None:
+            return self._career_opening_dedupe_cache
+
+        tokens: set[str] = set()
+        try:
+            all_rows = self._retry_on_quota(ws.get_all_records)
+            if isinstance(all_rows, list):
+                for record in all_rows:
+                    if not isinstance(record, dict):
+                        continue
+                    token = self._build_opening_dedupe_key(
+                        {
+                            "job_title": record.get("Job Title", ""),
+                            "apply_link": record.get("Apply Link", ""),
+                        }
+                    )
+                    if token:
+                        tokens.add(token)
+        except Exception as exc:
+            log.warning("Could not hydrate career-opening dedupe cache: %s", exc)
+
+        self._career_opening_dedupe_cache = tokens
+        return tokens
+
+    def _hydrate_associate_dedupe_cache(self, ws: Any) -> set[str]:
+        if self._associate_dedupe_cache is not None:
+            return self._associate_dedupe_cache
+
+        tokens: set[str] = set()
+        try:
+            all_rows = self._retry_on_quota(ws.get_all_records)
+            if isinstance(all_rows, list):
+                for record in all_rows:
+                    if not isinstance(record, dict):
+                        continue
+                    token = self._opening_change_token(
+                        {
+                            "status": record.get("Status", ""),
+                            "hash_id": record.get("Hash ID", ""),
+                            "role": record.get("Job Title", ""),
+                            "apply_url": record.get("Apply Link", ""),
+                        }
+                    )
+                    if token:
+                        tokens.add(token)
+        except Exception as exc:
+            log.warning("Could not hydrate associate-role dedupe cache: %s", exc)
+
+        self._associate_dedupe_cache = tokens
+        return tokens
+
+    @classmethod
+    def _opening_change_hash_id(cls, item: dict) -> str:
+        return build_job_hash(
+            str(item.get("company", "")),
+            str(item.get("role") or item.get("job_title") or item.get("position_title") or ""),
+            str(item.get("location", "Not Specified")),
+            str(item.get("apply_url") or item.get("apply_link") or item.get("position_link") or ""),
+        )
+
+    @classmethod
+    def _opening_change_token(cls, item: dict) -> str:
+        status = cls._normalize_text(item.get("status") or "")
+        role = cls._normalize_text(item.get("role") or item.get("title") or item.get("job_title") or item.get("position_title") or "")
+        company = cls._normalize_text(item.get("company") or item.get("domain") or "")
+        location = cls._normalize_text(item.get("location") or "not specified")
+        link = normalize_url(str(item.get("apply_url") or item.get("url") or item.get("apply_link") or item.get("position_link") or ""))
+        return f"{status}|{company}|{role}|{location}|{link}"
+
+    def _hydrate_worksheet_dedupe_cache(self, ws: Any, cache_key: str, token_builder) -> set[str]:
+        existing = self._worksheet_dedupe_caches.get(cache_key)
+        if existing is not None:
+            return existing
+
+        tokens: set[str] = set()
+        try:
+            rows = self._retry_on_quota(ws.get_all_records)
+            if isinstance(rows, list):
+                for record in rows:
+                    if not isinstance(record, dict):
+                        continue
+                    token = token_builder(record)
+                    if token:
+                        tokens.add(token)
+        except Exception as exc:
+            log.warning("Could not hydrate dedupe cache for %s: %s", cache_key, exc)
+
+        self._worksheet_dedupe_caches[cache_key] = tokens
+        return tokens
+
+    @staticmethod
+    def _company_opening_row(item: dict) -> list[Any]:
+        ts = item.get("timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        run_id = item.get("run_id") or ""
+        run_iteration = int(item.get("run_iteration", 0) or 0)
+        role = item.get("role") or item.get("title") or item.get("job_title") or item.get("position_title") or ""
+        company = item.get("company") or item.get("domain") or ""
+        location = item.get("location") or "Not Specified"
+        experience = item.get("experience") or "Not Specified"
+        apply_url = item.get("apply_url") or item.get("url") or item.get("apply_link") or item.get("position_link") or ""
+        status = str(item.get("status") or "ACTIVE").upper()
+        first_seen = item.get("first_seen") or ""
+        last_seen = item.get("last_seen") or ""
+        closed_at = item.get("closed_at") or ""
+
+        return [
+            run_iteration,
+            status,
+            company,
+            role,
+            location,
+            experience,
+            apply_url,
+            first_seen,
+            last_seen,
+            closed_at,
+            run_id,
+            ts,
+        ]
+
+    @staticmethod
+    def _new_opening_row(item: dict) -> list[Any]:
+        ts = item.get("timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        status = str(item.get("status") or "NEW").upper()
+        hash_id = item.get("hash_id") or GoogleSheetsClient._opening_change_hash_id(item)
+        status_color = item.get("status_color") or GoogleSheetsClient._status_color(status)
+        return [
+            ts,
+            item.get("run_id") or "",
+            int(item.get("run_iteration", 0) or 0),
+            item.get("company") or item.get("domain") or "",
+            item.get("role") or item.get("job_title") or item.get("position_title") or "",
+            item.get("location") or "Not Specified",
+            item.get("apply_url") or item.get("apply_link") or item.get("position_link") or "",
+            status,
+            hash_id,
+            status_color,
+        ]
 
     # ── public API ───────────────────────────────────────────────────────
     def append_job_row(self, job_data: dict) -> bool:
@@ -235,6 +700,17 @@ class GoogleSheetsClient:
         """
         try:
             self._ensure_header_row()
+
+            token = self._build_primary_dedupe_key(job_data)
+            if token:
+                existing = self._hydrate_primary_dedupe_cache()
+                if token in existing:
+                    log.info(
+                        "Skipping duplicate primary-sheet row for '%s' (%s)",
+                        job_data.get("job_title", ""),
+                        job_data.get("apply_link", ""),
+                    )
+                    return True
 
             ts = job_data.get("timestamp") or datetime.now(timezone.utc).strftime(
                 "%Y-%m-%d %H:%M:%S UTC"
@@ -256,8 +732,35 @@ class GoogleSheetsClient:
 
             self._retry_on_quota(self._ws.append_row, row,
                                  value_input_option="USER_ENTERED")
+            if token:
+                self._hydrate_primary_dedupe_cache().add(token)
             log.info("Appended row for '%s' at '%s'", job_data.get(
                 "job_title"), job_data.get("company"))
+
+            # Mirror associate-level roles to dedicated worksheet.
+            if self._is_associate_role_title(str(job_data.get("job_title", ""))):
+                self.append_associate_opening_row(
+                    {
+                        "timestamp": ts,
+                        "run_id": "",
+                        "run_iteration": 0,
+                        "job_title": job_data.get("job_title", ""),
+                        "company": job_data.get("company", ""),
+                        "location": job_data.get("location", ""),
+                        "type": job_data.get("job_type", ""),
+                        "apply_link": job_data.get("apply_link", ""),
+                        "posted_date": job_data.get("posted_date", ""),
+                        "source_url": "",
+                        "matched_role": job_data.get("matched_keywords", ""),
+                        "status": job_data.get("status", "New"),
+                        "notes": job_data.get("notes", ""),
+                        "hash_id": "",
+                        "first_seen": "",
+                        "last_seen": "",
+                        "closed_at": "",
+                        "status_color": "",
+                    }
+                )
             return True
 
         except gspread.exceptions.APIError as exc:
@@ -283,6 +786,53 @@ class GoogleSheetsClient:
             self._retry_on_quota(ws.append_row, row, value_input_option="USER_ENTERED")
             appended += 1
         return appended
+
+    def _next_append_row_number(self, ws: Any) -> int:
+        values = self._retry_on_quota(ws.get_all_values)
+        if not isinstance(values, list):
+            return 2
+        return len(values) + 1
+
+    def _apply_row_background(self, ws: Any, row_number: int, total_columns: int, hex_color: str) -> None:
+        if row_number <= 1:
+            return
+        r, g, b = self._hex_to_rgb_components(hex_color)
+        request = {
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": ws.id,
+                            "startRowIndex": row_number - 1,
+                            "endRowIndex": row_number,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": max(1, int(total_columns)),
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {
+                                    "red": r,
+                                    "green": g,
+                                    "blue": b,
+                                }
+                            }
+                        },
+                        "fields": "userEnteredFormat.backgroundColor",
+                    }
+                }
+            ]
+        }
+        self._retry_on_quota(self._spreadsheet.batch_update, request)
+
+    def _append_colored_marker_row(self, ws: Any, row: list[Any], color: str, headers: list[str]) -> bool:
+        try:
+            row_number = self._next_append_row_number(ws)
+            self._retry_on_quota(ws.append_row, row, value_input_option="USER_ENTERED")
+            self._apply_row_background(ws, row_number=row_number, total_columns=len(headers), hex_color=color)
+            return True
+        except Exception as exc:
+            log.warning("Failed to append colored marker row in worksheet '%s': %s", getattr(ws, "title", "?"), exc)
+            return False
 
     @staticmethod
     def _build_url_change_row(change_data: dict) -> list[Any]:
@@ -325,6 +875,95 @@ class GoogleSheetsClient:
             status,
         ]
 
+    @staticmethod
+    def _build_associate_opening_row(opening_data: dict) -> list[Any]:
+        status = str(opening_data.get("status", "New") or "New").upper()
+        status_color = opening_data.get("status_color") or GoogleSheetsClient._status_color(status)
+        return [
+            opening_data.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+            opening_data.get("run_id", ""),
+            int(opening_data.get("run_iteration", 0) or 0),
+            opening_data.get("job_title", ""),
+            opening_data.get("company", ""),
+            opening_data.get("location", ""),
+            opening_data.get("type", ""),
+            opening_data.get("apply_link", ""),
+            opening_data.get("posted_date", ""),
+            opening_data.get("source_url", ""),
+            opening_data.get("matched_role", ""),
+            status,
+            opening_data.get("notes", ""),
+            opening_data.get("hash_id", ""),
+            opening_data.get("first_seen", ""),
+            opening_data.get("last_seen", ""),
+            opening_data.get("closed_at", ""),
+            status_color,
+        ]
+
+    def append_iteration_divider_row(self, *, run_iteration: int, run_timestamp: str, run_id: str = "") -> bool:
+        """Append a visual divider row for the current run in All_Openings."""
+        try:
+            ws = self._get_or_create_worksheet(ALL_OPENINGS_WORKSHEET, ALL_OPENINGS_HEADERS)
+            ts = str(run_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+            short_ts = ts.replace(" UTC", "")
+            divider_text = f"===== RUN {int(run_iteration)} | {short_ts} ====="
+            row = [
+                int(run_iteration),
+                "RUN_HEADER",
+                "",
+                divider_text,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                str(run_id or ""),
+                ts,
+            ]
+            return self._append_colored_marker_row(ws, row=row, color=_RUN_DIVIDER_COLOR, headers=ALL_OPENINGS_HEADERS)
+        except Exception as exc:
+            log.warning("Failed to append run divider row: %s", exc)
+            return False
+
+    def append_iteration_summary_row(
+        self,
+        *,
+        run_iteration: int,
+        run_timestamp: str,
+        run_id: str,
+        jobs_found: int,
+        new_jobs: int,
+        closed_jobs: int,
+    ) -> bool:
+        """Append a yellow summary row for the current run in All_Openings."""
+        try:
+            ws = self._get_or_create_worksheet(ALL_OPENINGS_WORKSHEET, ALL_OPENINGS_HEADERS)
+            ts = str(run_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+            hhmm = ts[11:16] if len(ts) >= 16 else ts
+            summary_text = (
+                f"Jobs Found: {int(jobs_found)} | New Jobs: {int(new_jobs)} | "
+                f"Closed Jobs: {int(closed_jobs)} | Time: {hhmm}"
+            )
+            row = [
+                int(run_iteration),
+                "SUMMARY",
+                "",
+                summary_text,
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                str(run_id or ""),
+                ts,
+            ]
+            return self._append_colored_marker_row(ws, row=row, color=_RUN_SUMMARY_COLOR, headers=ALL_OPENINGS_HEADERS)
+        except Exception as exc:
+            log.warning("Failed to append run summary row: %s", exc)
+            return False
+
     def append_url_change_row(self, change_data: dict) -> bool:
         """Append one URL/page-change event to dedicated worksheet."""
         return self.append_url_change_rows([change_data]) > 0
@@ -351,11 +990,355 @@ class GoogleSheetsClient:
             return 0
         try:
             ws = self._get_or_create_worksheet(CAREER_OPENINGS_WORKSHEET, CAREER_OPENINGS_HEADERS)
-            rows = [self._build_career_opening_row(item) for item in opening_rows]
-            return self._append_rows_optimized(ws, rows)
+            existing = self._hydrate_career_opening_dedupe_cache(ws)
+
+            unique_items: list[dict] = []
+            for item in opening_rows:
+                token = self._build_opening_dedupe_key(item)
+                if token and token in existing:
+                    continue
+                if token:
+                    existing.add(token)
+                unique_items.append(item)
+
+            if not unique_items:
+                return 0
+
+            rows = [self._build_career_opening_row(item) for item in unique_items]
+            appended = self._append_rows_optimized(ws, rows)
+
+            # Fan-out associate roles to dedicated worksheet.
+            associate_items = [
+                {
+                    "timestamp": item.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+                    "run_id": item.get("run_id", ""),
+                    "run_iteration": int(item.get("run_iteration", 0) or 0),
+                    "job_title": item.get("job_title") or item.get("position_title") or "",
+                    "company": item.get("company") or item.get("domain") or "",
+                    "location": item.get("location", ""),
+                    "type": item.get("type") or item.get("job_type") or "",
+                    "apply_link": item.get("apply_link") or item.get("position_link") or "",
+                    "posted_date": item.get("posted_date", ""),
+                    "source_url": item.get("source_url") or item.get("career_url") or "",
+                    "matched_role": item.get("matched_role", ""),
+                    "status": item.get("status", "New"),
+                    "notes": item.get("notes", ""),
+                    "hash_id": item.get("hash_id") or GoogleSheetsClient._opening_change_hash_id(item),
+                    "first_seen": item.get("first_seen", ""),
+                    "last_seen": item.get("last_seen", ""),
+                    "closed_at": item.get("closed_at", ""),
+                    "status_color": item.get("status_color", ""),
+                }
+                for item in unique_items
+                if self._is_associate_role_title(str(item.get("job_title") or item.get("position_title") or ""))
+            ]
+            if associate_items:
+                self.append_associate_opening_rows(associate_items)
+
+            return appended
         except Exception as exc:
             log.error("Failed to append career opening rows: %s", exc)
             return 0
+
+    def append_associate_opening_row(self, opening_data: dict) -> bool:
+        """Append one associate-level role row to dedicated worksheet."""
+        return self.append_associate_opening_rows([opening_data]) > 0
+
+    def append_associate_opening_rows(self, opening_rows: list[dict]) -> int:
+        """Append associate-level role rows in batch with dedupe."""
+        if not opening_rows:
+            return 0
+        try:
+            ws = self._get_or_create_worksheet(ASSOCIATE_ROLES_WORKSHEET, ASSOCIATE_ROLES_HEADERS)
+            existing = self._hydrate_associate_dedupe_cache(ws)
+
+            unique_items: list[dict] = []
+            for item in opening_rows:
+                title = str(item.get("job_title") or item.get("position_title") or "")
+                if not self._is_associate_role_title(title):
+                    continue
+
+                token = self._opening_change_token(item)
+                if token and token in existing:
+                    continue
+                if token:
+                    existing.add(token)
+                unique_items.append(item)
+
+            if not unique_items:
+                return 0
+
+            rows = [self._build_associate_opening_row(item) for item in unique_items]
+            return self._append_rows_optimized(ws, rows)
+        except Exception as exc:
+            log.error("Failed to append associate opening rows: %s", exc)
+            return 0
+
+    def append_all_openings_rows(self, opening_rows: list[dict]) -> int:
+        """Append opening change rows into All_Openings worksheet with dedupe."""
+        if not opening_rows:
+            return 0
+        try:
+            ws = self._get_or_create_worksheet(ALL_OPENINGS_WORKSHEET, ALL_OPENINGS_HEADERS)
+            existing = self._hydrate_worksheet_dedupe_cache(
+                ws,
+                cache_key=ALL_OPENINGS_WORKSHEET,
+                token_builder=lambda row: self._opening_change_token(
+                    {
+                        "status": row.get("Status", ""),
+                        "company": row.get("Company", ""),
+                        "role": row.get("Title", ""),
+                        "location": row.get("Location", ""),
+                        "url": row.get("URL", ""),
+                    }
+                ),
+            )
+
+            unique_items: list[dict] = []
+            for item in opening_rows:
+                token = self._opening_change_token(item)
+                if token and token in existing:
+                    continue
+                if token:
+                    existing.add(token)
+                unique_items.append(item)
+
+            if not unique_items:
+                return 0
+
+            rows = [self._company_opening_row(item) for item in unique_items]
+            return self._append_rows_optimized(ws, rows)
+        except Exception as exc:
+            log.error("Failed to append all opening rows: %s", exc)
+            return 0
+
+    def append_new_openings_rows(self, opening_rows: list[dict]) -> int:
+        """Append NEW/UPDATED opening rows into New_Openings worksheet with dedupe."""
+        if not opening_rows:
+            return 0
+        try:
+            ws = self._get_or_create_worksheet(NEW_OPENINGS_WORKSHEET, NEW_OPENINGS_HEADERS)
+            existing = self._hydrate_worksheet_dedupe_cache(
+                ws,
+                cache_key=NEW_OPENINGS_WORKSHEET,
+                token_builder=lambda row: self._opening_change_token(
+                    {
+                        "status": row.get("Status", ""),
+                        "hash_id": row.get("Hash ID", ""),
+                        "role": row.get("Role", ""),
+                        "apply_url": row.get("Apply URL", ""),
+                    }
+                ),
+            )
+
+            unique_items: list[dict] = []
+            for item in opening_rows:
+                status = str(item.get("status") or "").upper()
+                if status not in {"NEW", "UPDATED", "ACTIVE"}:
+                    continue
+                token = self._opening_change_token(item)
+                if token and token in existing:
+                    continue
+                if token:
+                    existing.add(token)
+                unique_items.append(item)
+
+            if not unique_items:
+                return 0
+
+            rows = [self._new_opening_row(item) for item in unique_items]
+            return self._append_rows_optimized(ws, rows)
+        except Exception as exc:
+            log.error("Failed to append new opening rows: %s", exc)
+            return 0
+
+    def append_company_opening_rows(self, source_url: str, opening_rows: list[dict]) -> int:
+        """Append opening change rows to company-specific worksheet (one per source URL)."""
+        if not source_url or not opening_rows:
+            return 0
+        try:
+            sheet_title = safe_sheet_title_from_url(source_url)
+            ws = self._get_or_create_worksheet(sheet_title, ALL_OPENINGS_HEADERS)
+            cache_key = f"company::{sheet_title}"
+            existing = self._hydrate_worksheet_dedupe_cache(
+                ws,
+                cache_key=cache_key,
+                token_builder=lambda row: self._opening_change_token(
+                    {
+                        "status": row.get("Status", ""),
+                        "company": row.get("Company", ""),
+                        "role": row.get("Title", ""),
+                        "location": row.get("Location", ""),
+                        "url": row.get("URL", ""),
+                    }
+                ),
+            )
+
+            unique_items: list[dict] = []
+            for item in opening_rows:
+                token = self._opening_change_token(item)
+                if token and token in existing:
+                    continue
+                if token:
+                    existing.add(token)
+                enriched = dict(item)
+                enriched["source_url"] = str(item.get("source_url") or source_url)
+                unique_items.append(enriched)
+
+            if not unique_items:
+                return 0
+
+            rows = [self._company_opening_row(item) for item in unique_items]
+            return self._append_rows_optimized(ws, rows)
+        except Exception as exc:
+            log.error("Failed to append company opening rows for %s: %s", source_url, exc)
+            return 0
+
+    def _collect_hash_row_numbers(self, ws: Any) -> dict[str, list[int]]:
+        values = self._retry_on_quota(ws.get_all_values)
+        if not values or len(values) < 2:
+            return {}
+
+        header = [str(h or "").strip() for h in values[0]]
+        hash_idx = None
+        company_idx = None
+        title_idx = None
+        location_idx = None
+        url_idx = None
+        for idx, name in enumerate(header):
+            name_l = name.lower()
+            if name_l == "hash id":
+                hash_idx = idx
+            elif name_l == "company":
+                company_idx = idx
+            elif name_l in {"title", "role", "job title"}:
+                title_idx = idx
+            elif name_l == "location":
+                location_idx = idx
+            elif name_l in {"url", "apply url", "apply link"}:
+                url_idx = idx
+
+        if hash_idx is None and (company_idx is None or title_idx is None or url_idx is None):
+            return {}
+
+        mapping: dict[str, list[int]] = {}
+        for row_num in range(2, len(values) + 1):
+            row = values[row_num - 1]
+            if hash_idx is not None:
+                hash_id = str(row[hash_idx] if hash_idx < len(row) else "").strip().lower()
+            else:
+                company = str(row[company_idx] if company_idx is not None and company_idx < len(row) else "").strip()
+                title = str(row[title_idx] if title_idx is not None and title_idx < len(row) else "").strip()
+                location = str(row[location_idx] if location_idx is not None and location_idx < len(row) else "Not Specified").strip() or "Not Specified"
+                url = str(row[url_idx] if url_idx is not None and url_idx < len(row) else "").strip()
+                if not company and not title and not url:
+                    continue
+                hash_id = build_job_hash(company, title, location, url).strip().lower()
+            if not hash_id:
+                continue
+            mapping.setdefault(hash_id, []).append(row_num)
+        return mapping
+
+    def _batch_delete_rows(self, ws: Any, row_numbers: list[int]) -> int:
+        unique_rows = sorted({int(r) for r in row_numbers if int(r) > 1}, reverse=True)
+        if not unique_rows:
+            return 0
+
+        requests = [
+            {
+                "deleteDimension": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": row_num - 1,
+                        "endIndex": row_num,
+                    }
+                }
+            }
+            for row_num in unique_rows
+        ]
+
+        self._retry_on_quota(self._spreadsheet.batch_update, {"requests": requests})
+        return len(unique_rows)
+
+    def delete_openings_by_hash_ids(self, hash_ids: list[str], source_urls: list[str] | None = None) -> dict[str, int]:
+        """Delete openings from active sheets by Hash ID using batch row deletion.
+
+        Affected worksheets:
+          - All_Openings
+          - Associate Roles
+          - Company-specific sheets (from source_urls)
+
+        New_Openings is intentionally untouched to preserve history.
+        """
+        normalized_hashes = {
+            str(hash_id).strip().lower()
+            for hash_id in (hash_ids or [])
+            if str(hash_id).strip()
+        }
+        if not normalized_hashes:
+            return {
+                "all_openings": 0,
+                "associate_roles": 0,
+                "company_rows": 0,
+                "company_sheets": 0,
+                "total": 0,
+            }
+
+        deleted_all = 0
+        deleted_associate = 0
+        deleted_company = 0
+        company_sheet_hits = 0
+
+        try:
+            ws_all = self._get_or_create_worksheet(ALL_OPENINGS_WORKSHEET, ALL_OPENINGS_HEADERS)
+            hash_rows = self._collect_hash_row_numbers(ws_all)
+            rows = [row for hash_id in normalized_hashes for row in hash_rows.get(hash_id, [])]
+            deleted_all = self._batch_delete_rows(ws_all, rows)
+            if deleted_all:
+                self._worksheet_dedupe_caches.pop(ALL_OPENINGS_WORKSHEET, None)
+        except Exception as exc:
+            log.warning("Failed hash-based deletion in %s: %s", ALL_OPENINGS_WORKSHEET, exc)
+
+        try:
+            ws_assoc = self._get_or_create_worksheet(ASSOCIATE_ROLES_WORKSHEET, ASSOCIATE_ROLES_HEADERS)
+            hash_rows = self._collect_hash_row_numbers(ws_assoc)
+            rows = [row for hash_id in normalized_hashes for row in hash_rows.get(hash_id, [])]
+            deleted_associate = self._batch_delete_rows(ws_assoc, rows)
+            if deleted_associate:
+                self._associate_dedupe_cache = None
+        except Exception as exc:
+            log.warning("Failed hash-based deletion in %s: %s", ASSOCIATE_ROLES_WORKSHEET, exc)
+
+        candidate_urls = sorted(
+            {
+                str(url).strip()
+                for url in (source_urls or [])
+                if str(url).strip()
+            }
+        )
+        for source_url in candidate_urls:
+            try:
+                sheet_title = safe_sheet_title_from_url(source_url)
+                ws_company = self._get_or_create_worksheet(sheet_title, ALL_OPENINGS_HEADERS)
+                hash_rows = self._collect_hash_row_numbers(ws_company)
+                rows = [row for hash_id in normalized_hashes for row in hash_rows.get(hash_id, [])]
+                deleted = self._batch_delete_rows(ws_company, rows)
+                if deleted:
+                    deleted_company += deleted
+                    company_sheet_hits += 1
+                    self._worksheet_dedupe_caches.pop(f"company::{sheet_title}", None)
+            except Exception as exc:
+                log.warning("Failed hash-based deletion in company worksheet for %s: %s", source_url, exc)
+
+        total = deleted_all + deleted_associate + deleted_company
+        return {
+            "all_openings": deleted_all,
+            "associate_roles": deleted_associate,
+            "company_rows": deleted_company,
+            "company_sheets": company_sheet_hits,
+            "total": total,
+        }
 
     @staticmethod
     def _build_search_activity_row(activity_data: dict) -> list[Any]:
@@ -365,6 +1348,8 @@ class GoogleSheetsClient:
 
         return [
             activity_data.get("timestamp", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")),
+            activity_data.get("run_id", ""),
+            int(activity_data.get("run_iteration", 0) or 0),
             activity_data.get("url", ""),
             activity_data.get("domain", ""),
             activity_data.get("status", ""),

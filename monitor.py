@@ -6,6 +6,7 @@ Main orchestrator script connecting config, API, filtering, and notifications.
 
 import argparse
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -19,6 +20,13 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from classifier import normalize_company_name
+from dedup import (
+    build_job_hash,
+    build_job_key,
+    build_title_location_key,
+    normalize_url,
+)
 from job_scraper import extract_job_postings, is_valid_job_posting
 
 from config_loader import ConfigLoader
@@ -32,6 +40,8 @@ from job_extractor import (
     stable_job_dedupe_key,
 )
 from role_filter import filter_jobs_by_role, matches_target_role
+from scraper import JobScraperEngine
+from sheet_writer import SheetWriter
 from state_manager import StateManager
 
 try:
@@ -51,6 +61,7 @@ JOBS_FILE = os.path.join(SCRIPT_DIR, "jobs.txt")
 FILTERS_FILE = os.path.join(SCRIPT_DIR, "filters.txt")
 STATE_FILE = os.path.join(SCRIPT_DIR, "state.json")
 PAUSE_FILE = os.path.join(SCRIPT_DIR, "pause.txt")
+LOCK_FILE = os.path.join(SCRIPT_DIR, "monitor.lock")
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 
 # ── Logging ──────────────────────────────────────────────────────────────────
@@ -85,6 +96,65 @@ _COMPANY_STOP_WORDS = {
     "global", "group", "inc", "llc", "ltd", "limited", "co", "company",
     "com", "io", "net", "org", "ai", "pk", "eu", "hr", "site",
 }
+
+
+def _acquire_monitor_lock(lock_file: str = LOCK_FILE, stale_after_seconds: int = 24 * 3600) -> dict[str, str] | None:
+    """Acquire a cycle lock. Returns lock token if acquired, else None.
+
+    A stale lock older than `stale_after_seconds` is auto-removed.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    token = {
+        "pid": str(os.getpid()),
+        "started_at": now,
+    }
+
+    try:
+        if os.path.isfile(lock_file):
+            age = max(0.0, time.time() - os.path.getmtime(lock_file))
+            if age >= max(60, int(stale_after_seconds)):
+                try:
+                    os.remove(lock_file)
+                    log.warning("Removed stale monitor lock (age %.0fs): %s", age, lock_file)
+                except OSError:
+                    pass
+            else:
+                return None
+
+        with open(lock_file, "w", encoding="utf-8") as f:
+            json.dump(token, f, ensure_ascii=False)
+        return token
+    except Exception as exc:
+        log.warning("Could not acquire monitor lock at %s: %s", lock_file, exc)
+        return None
+
+
+def _release_monitor_lock(token: dict[str, str] | None, lock_file: str = LOCK_FILE) -> None:
+    """Release cycle lock if owned by current token."""
+    if not token:
+        return
+    try:
+        if not os.path.isfile(lock_file):
+            return
+
+        can_delete = True
+        try:
+            with open(lock_file, "r", encoding="utf-8") as f:
+                current = json.load(f)
+            current_pid = str((current or {}).get("pid") or "")
+            current_started = str((current or {}).get("started_at") or "")
+            if current_pid and current_started:
+                can_delete = (
+                    current_pid == str(token.get("pid") or "")
+                    and current_started == str(token.get("started_at") or "")
+                )
+        except Exception:
+            can_delete = True
+
+        if can_delete:
+            os.remove(lock_file)
+    except Exception as exc:
+        log.warning("Could not release monitor lock at %s: %s", lock_file, exc)
 
 
 def _normalize_company_candidate(value: str) -> str:
@@ -249,6 +319,100 @@ def _opening_fingerprint(opening: dict[str, str]) -> str:
     return f"{title}|{link}"
 
 
+def _normalize_opening_record(opening: dict[str, object], source_url: str, fallback_company: str) -> dict[str, str]:
+    title = _normalize_whitespace(str(opening.get("title") or opening.get("job_title") or ""))
+    apply_link = str(
+        opening.get("link")
+        or opening.get("apply_link")
+        or opening.get("job_url")
+        or ""
+    ).strip()
+    company = normalize_company_name(
+        str(opening.get("company") or opening.get("domain") or ""),
+        fallback_url=source_url or fallback_company,
+    )
+    location = _normalize_whitespace(str(opening.get("location") or "Not Specified")) or "Not Specified"
+    category = _normalize_whitespace(str(opening.get("category") or opening.get("department") or "Not Specified")) or "Not Specified"
+    experience = _normalize_whitespace(str(opening.get("experience") or "Not Specified")) or "Not Specified"
+    job_type = _normalize_whitespace(str(opening.get("type") or opening.get("job_type") or "Not Specified")) or "Not Specified"
+    apply_link_norm = normalize_url(apply_link)
+
+    return {
+        "title": title,
+        "company": company,
+        "location": location,
+        "category": category,
+        "experience": experience,
+        "job_type": job_type,
+        "apply_link": apply_link_norm or apply_link,
+        "source_url": source_url,
+    }
+
+
+def _detect_opening_changes(
+    previous_snapshots: dict[str, dict],
+    current_openings: list[dict[str, str]],
+) -> tuple[list[dict[str, str]], dict[str, dict], set[str]]:
+    previous = previous_snapshots if isinstance(previous_snapshots, dict) else {}
+    current_map: dict[str, dict] = {}
+    title_location_index_prev: dict[str, str] = {}
+    consumed_previous_keys: set[str] = set()
+    changes: list[dict[str, str]] = []
+    fingerprints: set[str] = set()
+
+    for prev_key, prev_item in previous.items():
+        if not isinstance(prev_item, dict):
+            continue
+        tl = build_title_location_key(prev_item.get("title", ""), prev_item.get("location", ""))
+        if tl and tl not in title_location_index_prev:
+            title_location_index_prev[tl] = prev_key
+
+    for opening in current_openings:
+        key = build_job_key(opening.get("title", ""), opening.get("location", ""), opening.get("apply_link", ""))
+        if not key or key in current_map:
+            continue
+
+        hash_id = build_job_hash(
+            opening.get("company", ""),
+            opening.get("title", ""),
+            opening.get("location", ""),
+            opening.get("apply_link", ""),
+        )
+        snapshot = {
+            "title": opening.get("title", ""),
+            "company": opening.get("company", ""),
+            "location": opening.get("location", "Not Specified"),
+            "category": opening.get("category", "Not Specified"),
+            "experience": opening.get("experience", "Not Specified"),
+            "job_type": opening.get("job_type", "Not Specified"),
+            "apply_link": opening.get("apply_link", ""),
+            "source_url": opening.get("source_url", ""),
+            "hash_id": hash_id,
+            "job_key": key,
+        }
+        current_map[key] = snapshot
+        fingerprints.add(_opening_fingerprint({"title": snapshot["title"], "link": snapshot["apply_link"]}))
+
+        prev = previous.get(key)
+        if prev is not None:
+            consumed_previous_keys.add(key)
+            prev_hash = str(prev.get("hash_id") or "")
+            if prev_hash != hash_id:
+                changes.append({**snapshot, "status": "UPDATED"})
+            continue
+
+        tl_key = build_title_location_key(snapshot["title"], snapshot["location"])
+        moved_prev_key = title_location_index_prev.get(tl_key)
+        if moved_prev_key and moved_prev_key not in consumed_previous_keys:
+            consumed_previous_keys.add(moved_prev_key)
+            changes.append({**snapshot, "status": "UPDATED"})
+            continue
+
+        changes.append({**snapshot, "status": "NEW"})
+
+    return changes, current_map, fingerprints
+
+
 def _iter_jsonld_nodes(payload: object):
     """Yield JSON-LD nodes from dict/list payloads, including @graph nodes."""
     if isinstance(payload, list):
@@ -328,6 +492,9 @@ def _extract_openings_from_html(base_url: str, html: str, max_positions: int = 5
         item = {
             "title": _normalize_whitespace(str(job.get("title") or "")),
             "link": str(job.get("apply_link") or job.get("job_url") or "").strip(),
+            "company": str(job.get("company") or ""),
+            "location": str(job.get("location") or "Not Specified"),
+            "type": str(job.get("type") or "Not Specified"),
         }
         if not item["title"] or not item["link"]:
             continue
@@ -383,6 +550,7 @@ def _monitor_single_url_sync(
     url: str,
     old_hash: str | None,
     previous_fingerprints: set[str],
+    previous_snapshots: dict[str, dict],
     scraper: object | None,
     max_pages_per_site: int,
     max_openings_per_page: int,
@@ -467,6 +635,7 @@ def _monitor_single_url_sync(
                 "new_hash": new_hash,
                 "status": "unchanged",
                 "new_fingerprints": list(previous_fingerprints),
+                "new_snapshots": previous_snapshots,
             }
 
         change_type = "new_url_tracked" if old_hash is None else "content_changed"
@@ -481,23 +650,47 @@ def _monitor_single_url_sync(
             )
 
         if not openings:
+            _, snapshot_map, current_fingerprints = _detect_opening_changes(previous_snapshots, [])
             return {
                 "url": url,
                 "new_hash": new_hash,
                 "status": "ignored_no_jobs",
                 "new_fingerprints": [],
+                "new_snapshots": snapshot_map,
                 "scraper_error": scraper_error,
             }
 
-        current_fingerprints = {_opening_fingerprint(o) for o in openings}
-        new_openings = [o for o in openings if _opening_fingerprint(o) not in previous_fingerprints]
+        fallback_company = urlparse(resolved_url or url).netloc
+        normalized_openings = [
+            _normalize_opening_record(item, resolved_url or url, fallback_company)
+            for item in openings
+            if isinstance(item, dict)
+        ]
+        opening_changes, snapshot_map, current_fingerprints = _detect_opening_changes(
+            previous_snapshots,
+            normalized_openings,
+        )
+        new_openings = [
+            {
+                "title": c.get("title", ""),
+                "link": c.get("apply_link", ""),
+                "location": c.get("location", "Not Specified"),
+                "company": c.get("company", ""),
+                "type": c.get("job_type", "Not Specified"),
+                "category": c.get("category", "Not Specified"),
+                "experience": c.get("experience", "Not Specified"),
+            }
+            for c in opening_changes
+            if c.get("status") == "NEW"
+        ]
 
-        if change_type == "content_changed" and not new_openings:
+        if change_type == "content_changed" and not opening_changes:
             return {
                 "url": url,
                 "new_hash": new_hash,
                 "status": "no_new_openings",
                 "new_fingerprints": list(current_fingerprints),
+                "new_snapshots": snapshot_map,
             }
 
         event = {
@@ -508,8 +701,10 @@ def _monitor_single_url_sync(
             "page_title": page_title,
             "openings": openings,
             "new_openings": new_openings,
+            "opening_changes": opening_changes,
             "total_openings": len(openings),
             "new_openings_count": len(new_openings),
+            "opening_changes_count": len(opening_changes),
             "old_hash": old_hash or "",
             "new_hash": new_hash,
             "source": "links.txt",
@@ -523,6 +718,7 @@ def _monitor_single_url_sync(
             "status": change_type,
             "event": event,
             "new_fingerprints": list(current_fingerprints),
+            "new_snapshots": snapshot_map,
         }
     except requests.RequestException as exc:
         return {"url": url, "status": "error", "error": f"Request error — {exc}"}
@@ -534,6 +730,7 @@ async def _monitor_urls_async(
     urls: list[str],
     old_hashes: dict[str, str | None],
     opening_fingerprints: dict[str, set[str]],
+    opening_snapshots: dict[str, dict[str, dict]],
     scraper: object | None,
     max_pages_per_site: int,
     max_openings_per_page: int,
@@ -556,6 +753,7 @@ async def _monitor_urls_async(
                 target_url,
                 old_hashes.get(target_url),
                 opening_fingerprints.get(target_url, set()),
+                opening_snapshots.get(target_url, {}),
                 scraper,
                 max_pages_per_site,
                 max_openings_per_page,
@@ -588,12 +786,17 @@ def monitor_urls(
         url: state_mgr.get_url_opening_fingerprints(url)
         for url in urls
     }
+    opening_snapshots = {
+        url: state_mgr.get_url_job_snapshots(url)
+        for url in urls
+    }
 
     results = _run_async(
         _monitor_urls_async(
             urls=urls,
             old_hashes=old_hashes,
             opening_fingerprints=opening_fingerprints,
+            opening_snapshots=opening_snapshots,
             scraper=scraper,
             max_pages_per_site=max_pages_per_site,
             max_openings_per_page=max_openings_per_page,
@@ -615,6 +818,7 @@ def monitor_urls(
                 "change_type": str(event.get("change_type") or status),
                 "total_openings": int(event.get("total_openings", 0) or 0),
                 "new_openings_count": int(event.get("new_openings_count", 0) or 0),
+                "opening_changes_count": int(event.get("opening_changes_count", 0) or 0),
                 "scraper_used": str(event.get("scraper_used") or ""),
                 "pages_visited": event.get("pages_visited") if isinstance(event.get("pages_visited"), list) else [],
                 "error": str(result.get("error") or result.get("scraper_error") or ""),
@@ -643,10 +847,11 @@ def monitor_urls(
         elif status == "content_changed":
             event = result.get("event") if isinstance(result.get("event"), dict) else {}
             log.info(
-                "🔄  Change detected: %s (openings: %d, new openings: %d)",
+                "🔄  Change detected: %s (openings: %d, new openings: %d, changed rows: %d)",
                 target_url,
                 int(event.get("total_openings", 0) or 0),
                 int(event.get("new_openings_count", 0) or 0),
+                int(event.get("opening_changes_count", 0) or 0),
             )
 
         new_hash = str(result.get("new_hash", "")).strip()
@@ -656,6 +861,10 @@ def monitor_urls(
         new_fps = result.get("new_fingerprints", [])
         if isinstance(new_fps, list):
             state_mgr.set_url_opening_fingerprints(target_url, new_fps)
+
+        new_snapshots = result.get("new_snapshots")
+        if isinstance(new_snapshots, dict):
+            state_mgr.set_url_job_snapshots(target_url, new_snapshots)
 
         if isinstance(event, dict):
             change_events.append(event)
@@ -669,6 +878,208 @@ def monitor_urls(
     if return_activity:
         return change_events, activity_rows
     return change_events
+
+
+def _canonical_company_key(source_url: str, jobs: list[dict[str, str]]) -> str:
+    for job in jobs:
+        company = normalize_company_name(str(job.get("company") or ""), fallback_url=source_url)
+        if company:
+            return company
+    return normalize_company_name("", fallback_url=source_url)
+
+
+def _build_company_snapshot(source_url: str, jobs: list[dict[str, str]]) -> dict:
+    company_key = _canonical_company_key(source_url, jobs)
+    jobs_map: dict[str, dict] = {}
+
+    for job in jobs:
+        title = str(job.get("title") or "").strip()
+        location = str(job.get("location") or "Not Specified").strip() or "Not Specified"
+        apply_link = str(job.get("apply_link") or "").strip()
+        if not title or not apply_link:
+            continue
+
+        hash_id = build_job_hash(
+            company_key,
+            title,
+            location,
+            apply_link,
+        )
+        jobs_map[hash_id] = {
+            "title": title,
+            "company": company_key,
+            "location": location,
+            "category": str(job.get("category") or "Not Specified").strip() or "Not Specified",
+            "experience": str(job.get("experience") or "Not Specified").strip() or "Not Specified",
+            "job_type": str(job.get("job_type") or job.get("type") or "Not Specified").strip() or "Not Specified",
+            "apply_link": apply_link,
+            "source_url": source_url,
+            "hash_id": hash_id,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        }
+
+    return {
+        "company": company_key,
+        "url": source_url,
+        "jobs": jobs_map,
+    }
+
+
+async def _collect_company_snapshots_async(
+    urls: list[str],
+    timeout_seconds: int,
+    max_pages_per_site: int,
+    max_openings_per_site: int,
+    concurrency: int,
+) -> tuple[dict[str, dict], list[dict[str, object]], list[dict[str, object]]]:
+    scraper_engine = JobScraperEngine(
+        timeout_seconds=timeout_seconds,
+        max_pages=max_pages_per_site,
+        max_openings=max_openings_per_site,
+    )
+
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def _worker(url: str) -> tuple[str, dict[str, object]]:
+        async with sem:
+            result = await asyncio.to_thread(scraper_engine.scrape_url_jobs, url)
+            return url, result
+
+    results = await asyncio.gather(*[_worker(url) for url in urls])
+
+    companies_state: dict[str, dict] = {}
+    activity_rows: list[dict[str, object]] = []
+    site_results: list[dict[str, object]] = []
+
+    for target_url, result in results:
+        openings = result.get("openings") if isinstance(result.get("openings"), list) else []
+        normalized_jobs = [item for item in openings if isinstance(item, dict)]
+
+        ok = bool(result.get("ok"))
+        method = str(result.get("method") or "failed")
+        detected_platform = str(result.get("detected_platform") or "")
+        error_text = str(result.get("error") or "")
+
+        site_results.append(
+            {
+                "url": target_url,
+                "ok": ok,
+                "jobs_count": len(normalized_jobs),
+                "method": method,
+                "detected_platform": detected_platform,
+                "error": error_text,
+            }
+        )
+
+        # Only successful scrapes participate in closure evaluation.
+        if ok:
+            snapshot = _build_company_snapshot(target_url, normalized_jobs)
+            company_key = snapshot.get("company")
+            if company_key:
+                companies_state[company_key] = {
+                    "url": snapshot.get("url", target_url),
+                    "jobs": snapshot.get("jobs", {}),
+                }
+
+        activity_rows.append(
+            {
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "url": target_url,
+                "domain": urlparse(target_url).netloc,
+                "status": "ok" if ok else "error",
+                "change_type": "job_snapshot",
+                "total_openings": len(normalized_jobs),
+                "new_openings_count": 0,
+                "opening_changes_count": 0,
+                "scraper_used": method,
+                "pages_visited": [],
+                "error": error_text,
+                "notes": "Job-level monitor snapshot",
+            }
+        )
+
+    return companies_state, activity_rows, site_results
+
+
+def _diff_company_snapshots(
+    previous_state: dict[str, dict],
+    current_state: dict[str, dict],
+) -> tuple[list[dict], list[dict], list[dict], dict[str, list[dict]]]:
+    previous_jobs: dict[str, dict] = {}
+    current_jobs: dict[str, dict] = {}
+
+    for _company, payload in (previous_state or {}).items():
+        jobs = payload.get("jobs") if isinstance(payload, dict) else {}
+        if isinstance(jobs, dict):
+            for hash_id, job in jobs.items():
+                if isinstance(hash_id, str) and isinstance(job, dict):
+                    previous_jobs[hash_id] = dict(job)
+
+    for _company, payload in (current_state or {}).items():
+        jobs = payload.get("jobs") if isinstance(payload, dict) else {}
+        if isinstance(jobs, dict):
+            for hash_id, job in jobs.items():
+                if isinstance(hash_id, str) and isinstance(job, dict):
+                    current_jobs[hash_id] = dict(job)
+
+    new_jobs: list[dict] = []
+    updated_jobs: list[dict] = []
+    active_jobs: list[dict] = []
+
+    previous_tl_index: dict[str, str] = {}
+    for prev_hash, prev_job in previous_jobs.items():
+        tl = build_title_location_key(
+            str(prev_job.get("title") or ""),
+            str(prev_job.get("location") or ""),
+        )
+        if tl and tl not in previous_tl_index:
+            previous_tl_index[tl] = prev_hash
+
+    consumed_prev_hashes: set[str] = set()
+
+    for curr_hash, curr_job in current_jobs.items():
+        curr = dict(curr_job)
+        curr["status"] = "ACTIVE"
+        active_jobs.append(curr)
+
+        if curr_hash in previous_jobs:
+            consumed_prev_hashes.add(curr_hash)
+            continue
+
+        tl = build_title_location_key(
+            str(curr_job.get("title") or ""),
+            str(curr_job.get("location") or ""),
+        )
+        moved_prev = previous_tl_index.get(tl)
+        if moved_prev and moved_prev not in consumed_prev_hashes:
+            consumed_prev_hashes.add(moved_prev)
+            curr["status"] = "UPDATED"
+            updated_jobs.append(curr)
+        else:
+            curr["status"] = "NEW"
+            new_jobs.append(curr)
+
+    company_jobs: dict[str, list[dict]] = {}
+    for item in new_jobs + updated_jobs:
+        source_url = str(item.get("source_url") or "")
+        if source_url:
+            company_jobs.setdefault(source_url, []).append(item)
+
+    return new_jobs, updated_jobs, active_jobs, company_jobs
+
+
+def _flatten_company_jobs_by_hash(companies_state: dict[str, dict]) -> dict[str, dict]:
+    """Flatten company snapshot structure into hash-keyed current jobs map."""
+    flattened: dict[str, dict] = {}
+    for _company, payload in (companies_state or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        jobs = payload.get("jobs") if isinstance(payload.get("jobs"), dict) else {}
+        for hash_id, job in jobs.items():
+            if not isinstance(hash_id, str) or not hash_id.strip() or not isinstance(job, dict):
+                continue
+            flattened[hash_id.strip()] = dict(job)
+    return flattened
 
 
 async def _execute_jsearch_plan_async(
@@ -847,6 +1258,7 @@ async def _notify_url_changes_async(
 async def _search_internet_for_companies_async(
     sheets_client: object | None,
     links_file: str,
+    allowed_companies_file: str,
     max_companies: int = 20,
     max_results_per_company: int = 3,
 ) -> bool:
@@ -864,6 +1276,8 @@ async def _search_internet_for_companies_async(
             links_file,
             max_companies,
             max_results_per_company,
+            int(10),
+            allowed_companies_file,
         )
 
         if not results:
@@ -1087,6 +1501,15 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                 log.info("Health %s: %s", ch, status)
         return
 
+    run_metadata = state_mgr.begin_monitor_run(
+        persist=not args.dry_run,
+        now_ts=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+    )
+    run_id = str(run_metadata.get("run_id") or "")
+    run_iteration = int(run_metadata.get("run_iteration", 0) or 0)
+    now_utc = str(run_metadata.get("run_timestamp") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"))
+    log.info("Monitor run metadata: id=%s iteration=%d at=%s", run_id, run_iteration, now_utc)
+
     # 4. Prepare search inputs and API query budget
     titles = ConfigLoader.load_job_titles(JOBS_FILE)
     filters = ConfigLoader.load_filters(FILTERS_FILE)
@@ -1144,25 +1567,187 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
 
     all_qualified_jobs = []
 
-    # 5. Run links.txt scraping + JSearch API side-by-side
-    url_change_events, query_results, monitor_activity_rows = _run_async(
-        _run_sources_async(
-            state_mgr=state_mgr,
-            scraper=career_scraper,
+    # 5. Run links.txt job snapshot monitor (job-level hash diff) + JSearch queries
+    monitor_urls_list = monitored_urls
+    company_state_current, monitor_activity_rows, site_outcomes = _run_async(
+        _collect_company_snapshots_async(
+            urls=monitor_urls_list,
+            timeout_seconds=int(config.get("scraper_timeout_seconds", 15)),
             max_pages_per_site=int(config.get("link_scraper_max_pages", 8)),
-            max_openings_per_page=int(
-                config.get(
-                    "link_scraper_max_openings_per_site",
-                    config.get("playwright_max_openings_per_page", 80),
-                )
+            max_openings_per_site=min(
+                int(config.get("max_jobs_per_site", 50)),
+                int(
+                    config.get(
+                        "link_scraper_max_openings_per_site",
+                        config.get("playwright_max_openings_per_page", 80),
+                    )
+                ),
             ),
-            monitor_concurrency=max(1, int(config.get("url_monitor_async_concurrency", 4))),
-            jsearch=jsearch,
-            query_plan=query_plan,
-            jsearch_concurrency=max(1, int(config.get("jsearch_async_concurrency", 2))),
+            concurrency=max(1, int(config.get("url_monitor_async_concurrency", 5))),
         )
     )
-    state_mgr.save_state()
+
+    for row in monitor_activity_rows:
+        if isinstance(row, dict):
+            row["run_id"] = run_id
+            row["run_iteration"] = run_iteration
+
+    previous_company_state = state_mgr.get_company_job_state()
+    baseline_required = (not state_mgr.is_baseline_initialized()) or (not state_mgr.has_company_job_state())
+    append_only_history = _as_bool(config.get("append_only_openings_history", True), default=True)
+    remove_closed_rows = _as_bool(config.get("remove_closed_rows", False), default=False)
+    delete_closed_rows = bool(remove_closed_rows and not append_only_history)
+    if append_only_history and remove_closed_rows:
+        log.info("append_only_openings_history=true; closed rows will be retained in sheet history.")
+    missing_threshold = max(1, int(config.get("closed_missing_threshold", 2)))
+
+    previous_hash_state = state_mgr.get_job_hash_state()
+    post_hash_state = previous_hash_state
+    current_jobs_by_hash = _flatten_company_jobs_by_hash(company_state_current)
+    closed_jobs_for_sheet: list[dict] = []
+    closed_now_hashes: list[str] = []
+    skipped_missing_threshold = 0
+
+    previous_jobs_by_site: dict[str, int] = {}
+    for _hash, payload in previous_hash_state.items():
+        if not isinstance(payload, dict):
+            continue
+        src = str(payload.get("source_url") or "").strip()
+        if not src:
+            continue
+        previous_jobs_by_site[src] = previous_jobs_by_site.get(src, 0) + 1
+
+    evaluated_source_urls: set[str] = set()
+    for site in site_outcomes:
+        source_url = str(site.get("url") or "").strip()
+        ok = bool(site.get("ok"))
+        jobs_count = int(site.get("jobs_count", 0) or 0)
+        previous_count = int(previous_jobs_by_site.get(source_url, 0))
+
+        if not args.dry_run and source_url:
+            state_mgr.update_site_health(source_url, success=ok, error=str(site.get("error") or ""), at_ts=now_utc)
+
+        if not ok:
+            continue
+
+        # Failsafe: when a site suddenly returns zero while previously having many jobs,
+        # skip closure evaluation for that site to avoid mass false-deletes.
+        if jobs_count == 0 and previous_count > 5:
+            log.warning(
+                "Failsafe triggered for %s: current_jobs=0 while previous_jobs=%d. Skipping close evaluation for this site.",
+                source_url,
+                previous_count,
+            )
+            continue
+
+        if source_url:
+            evaluated_source_urls.add(source_url)
+
+    if baseline_required:
+        new_jobs_for_sheet: list[dict] = []
+        updated_jobs_for_sheet: list[dict] = []
+        active_jobs_for_sheet: list[dict] = []
+        company_jobs_for_sheet: dict[str, list[dict]] = {}
+        for _company, payload in company_state_current.items():
+            jobs = payload.get("jobs") if isinstance(payload, dict) else {}
+            if isinstance(jobs, dict):
+                for job in jobs.values():
+                    if isinstance(job, dict):
+                        active_jobs_for_sheet.append(dict(job))
+        log.info(
+            "Baseline initialization mode: captured %d active jobs across %d companies; suppressing NEW/UPDATED/removals this cycle.",
+            len(active_jobs_for_sheet),
+            len(company_state_current),
+        )
+        if not args.dry_run:
+            state_mgr.set_job_hash_state(current_jobs_by_hash, now_ts=now_utc)
+            post_hash_state = state_mgr.get_job_hash_state()
+        url_change_events: list[dict[str, object]] = []
+    else:
+        (
+            new_jobs_for_sheet,
+            updated_jobs_for_sheet,
+            active_jobs_for_sheet,
+            company_jobs_for_sheet,
+        ) = _diff_company_snapshots(previous_company_state, company_state_current)
+
+        if args.dry_run:
+            simulated_mgr = StateManager(filepath=STATE_FILE, max_notified_ids=state_mgr.max_notified_ids)
+            simulated_mgr.state = copy.deepcopy(state_mgr.state)
+            closed_now_hashes, skipped_missing_threshold = simulated_mgr.update_job_hash_state(
+                current_jobs_by_hash,
+                missing_threshold=missing_threshold,
+                now_ts=now_utc,
+                evaluated_source_urls=evaluated_source_urls,
+            )
+            post_hash_state = simulated_mgr.get_job_hash_state()
+        else:
+            closed_now_hashes, skipped_missing_threshold = state_mgr.update_job_hash_state(
+                current_jobs_by_hash,
+                missing_threshold=missing_threshold,
+                now_ts=now_utc,
+                evaluated_source_urls=evaluated_source_urls,
+            )
+            post_hash_state = state_mgr.get_job_hash_state()
+
+        for hash_id in closed_now_hashes:
+            meta = post_hash_state.get(hash_id, previous_hash_state.get(hash_id, {}))
+            if not isinstance(meta, dict):
+                meta = {}
+            closed_jobs_for_sheet.append(
+                {
+                    "hash_id": hash_id,
+                    "title": str(meta.get("title") or ""),
+                    "company": str(meta.get("company") or ""),
+                    "location": str(meta.get("location") or "Not Specified") or "Not Specified",
+                    "apply_link": str(meta.get("url") or ""),
+                    "source_url": str(meta.get("source_url") or ""),
+                    "first_seen": str(meta.get("first_seen") or ""),
+                    "last_seen": str(meta.get("last_seen") or now_utc),
+                    "closed_at": str(meta.get("closed_at") or now_utc),
+                    "status": "CLOSED",
+                }
+            )
+
+        url_change_events = [
+            {
+                "url": str(job.get("source_url") or ""),
+                "domain": urlparse(str(job.get("source_url") or "")).netloc,
+                "change_type": "job_level_diff",
+                "new_openings_count": len(new_jobs_for_sheet),
+                "opening_changes_count": len(new_jobs_for_sheet) + len(updated_jobs_for_sheet),
+            }
+        ] if (new_jobs_for_sheet or updated_jobs_for_sheet) else []
+
+    def _enrich_lifecycle_fields(rows: list[dict]) -> None:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            hash_id = str(row.get("hash_id") or "").strip()
+            meta = post_hash_state.get(hash_id, {}) if hash_id else {}
+            row["first_seen"] = str(row.get("first_seen") or meta.get("first_seen") or now_utc)
+            row["last_seen"] = str(row.get("last_seen") or meta.get("last_seen") or now_utc)
+            row["closed_at"] = str(row.get("closed_at") or meta.get("closed_at") or "")
+            row["run_id"] = str(row.get("run_id") or run_id)
+            row["run_iteration"] = int(row.get("run_iteration", run_iteration) or run_iteration)
+
+    _enrich_lifecycle_fields(new_jobs_for_sheet)
+    _enrich_lifecycle_fields(updated_jobs_for_sheet)
+    _enrich_lifecycle_fields(active_jobs_for_sheet)
+    _enrich_lifecycle_fields(closed_jobs_for_sheet)
+
+    for source_url, rows in (company_jobs_for_sheet or {}).items():
+        if not isinstance(rows, list):
+            continue
+        _enrich_lifecycle_fields(rows)
+
+    query_results = _run_async(
+        _execute_jsearch_plan_async(
+            jsearch=jsearch,
+            query_plan=query_plan,
+            concurrency=max(1, int(config.get("jsearch_async_concurrency", 2))),
+        )
+    )
 
     queries_used = 0
     company_query_count = 0
@@ -1224,9 +1809,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     if args.job_limit > 0:
         all_qualified_jobs = all_qualified_jobs[:args.job_limit]
 
-    # ── NEW: build job list from links.txt change events ────────────────
-    # This avoids noisy JSearch results and ensures we only notify jobs
-    # actually present on the career pages listed in `links.txt`.
+    # ── Build job list from job-level NEW delta (links.txt snapshot diff) ─
     url_based_qualified_jobs: list[dict[str, object]] = []
     url_based_new_jobs: list[dict[str, object]] = []
     url_based_new_job_ids: list[str] = []
@@ -1237,123 +1820,98 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     details_fetch_count = 0
     details_fetch_cap = int(config.get("job_details_max_per_cycle", 20))
     min_desc_chars = int(config.get("job_description_min_chars", 120))
-    url_change_log_baseline_openings = _as_bool(config.get("url_change_log_baseline_openings", True), default=True)
-
-    def _event_openings_to_consider(event: dict[str, object]) -> list[dict[str, object]]:
-        change_type = str(event.get("change_type") or "content_changed")
-        openings = event.get("new_openings")
-        if isinstance(openings, list) and openings:
-            return [o for o in openings if isinstance(o, dict)]
-        if change_type == "new_url_tracked" and url_change_log_baseline_openings:
-            base_openings = event.get("openings")
-            if isinstance(base_openings, list):
-                return [o for o in base_openings if isinstance(o, dict)]
-        return []
-
-    for event in url_change_events:
+    for opening in new_jobs_for_sheet:
         if len(url_based_new_jobs) >= details_fetch_cap:
             break
+        event_url = str(opening.get("source_url") or "")
+        event_domain = str(urlparse(event_url).netloc)
 
-        event_url = str(event.get("url") or "")
-        event_domain = str(event.get("domain") or "")
+        opening_title = str(opening.get("title") or "").strip()
+        opening_link = str(opening.get("apply_link") or "").strip()
 
-        for opening in _event_openings_to_consider(event):
-            opening_title = str(opening.get("title") or "").strip()
-            opening_link = str(opening.get("link") or opening.get("apply_link") or opening.get("job_url") or "").strip()
+        if not opening_title or not opening_link:
+            continue
 
-            if not opening_title or not opening_link:
-                continue
+        apply_link_norm = normalize_apply_link(opening_link)
+        if not apply_link_norm:
+            continue
 
-            apply_link_norm = normalize_apply_link(opening_link)
-            if not apply_link_norm:
-                continue
+        company = str(opening.get("company") or event_domain or "").strip()
+        location = str(opening.get("location") or "").strip()
+        job_type = str(opening.get("job_type") or opening.get("type") or "").strip()
+        posted_date_hint = str(opening.get("posted_date") or opening.get("posted_at") or "").strip()
 
-            company = str(opening.get("company") or event_domain or "").strip()
-            location = str(opening.get("location") or "").strip()
-            job_type = str(opening.get("type") or opening.get("job_type") or "").strip()
-            posted_date_hint = str(opening.get("posted_date") or opening.get("posted_at") or "").strip()
+        if not is_valid_job_posting(
+            {
+                "title": opening_title,
+                "apply_link": apply_link_norm,
+                "job_url": apply_link_norm,
+                "source_url": event_url,
+            }
+        ):
+            continue
 
-            # Structural validation before doing network calls.
-            if not is_valid_job_posting(
-                {
-                    "title": opening_title,
-                    "apply_link": apply_link_norm,
-                    "job_url": apply_link_norm,
-                    "source_url": event_url,
-                }
-            ):
-                continue
+        matched, matched_role, _score = matches_target_role(
+            opening_title,
+            description="",
+            target_roles=titles,
+            exclude_senior=True,
+        )
+        if not matched or not matched_role:
+            continue
 
-            # Title-only role filter: cheap prefilter.
-            matched, matched_role, _score = matches_target_role(
-                opening_title,
-                description="",
-                target_roles=titles,
-                exclude_senior=True,
-            )
-            if not matched or not matched_role:
-                continue
-
-            # Fetch description snippet from the job details page (apply link).
-            if apply_link_norm in job_details_cache:
-                snippet = job_details_cache[apply_link_norm]
-            else:
-                if details_fetch_count >= details_fetch_cap:
-                    # Hard cap to keep runtime inside GitHub Actions budget.
-                    break
-                snippet = fetch_job_description_snippet(
-                    apply_link_norm,
-                    scraper=career_scraper,
-                    timeout_seconds=int(config.get("request_timeout", 15)),
-                    min_chars=min_desc_chars,
-                    max_chars=1500,
-                )
-                job_details_cache[apply_link_norm] = snippet
-                details_fetch_count += 1
-
-            description = str(snippet.get("description") or "").strip()
-            if len(description) < min_desc_chars:
-                continue
-
-            # Title + description semantic/keyword verification.
-            matched2, matched_role2, match_score = matches_target_role(
-                opening_title,
-                description=description,
-                target_roles=titles,
-                exclude_senior=True,
-            )
-            if not matched2 or not matched_role2:
-                continue
-
-            # Build stable job key and dedupe vs state.json.
-            job_id = stable_job_dedupe_key(opening_title, company, apply_link_norm)
-            job_row = job_dict_for_sheet(
-                title=opening_title,
-                company=company or event_domain,
-                location=location or "",
-                job_type=job_type or "",
-                posted_date=str(snippet.get("posted_date") or posted_date_hint or ""),
-                apply_link=apply_link_norm,
-                description=description,
-                matched_role=matched_role2,
-                match_score=float(match_score or 0),
-                source_url=event_url or str(event.get("resolved_url") or ""),
-            )
-            job_row["job_id"] = job_id  # internal use for state dedupe
-
-            url_based_qualified_jobs.append(job_row)
-
-            if job_id in url_based_seen_ids:
-                continue
-
-            if state_mgr.is_new_job(job_id):
-                url_based_seen_ids.add(job_id)
-                url_based_new_jobs.append(job_row)
-                url_based_new_job_ids.append(job_id)
-            # Stop if we've filled the per-cycle job cap for notifications.
-            if len(url_based_new_jobs) >= details_fetch_cap:
+        if apply_link_norm in job_details_cache:
+            snippet = job_details_cache[apply_link_norm]
+        else:
+            if details_fetch_count >= details_fetch_cap:
                 break
+            snippet = fetch_job_description_snippet(
+                apply_link_norm,
+                scraper=career_scraper,
+                timeout_seconds=int(config.get("request_timeout", 15)),
+                min_chars=min_desc_chars,
+                max_chars=1500,
+            )
+            job_details_cache[apply_link_norm] = snippet
+            details_fetch_count += 1
 
+        description = str(snippet.get("description") or "").strip()
+        if len(description) < min_desc_chars:
+            continue
+
+        matched2, matched_role2, match_score = matches_target_role(
+            opening_title,
+            description=description,
+            target_roles=titles,
+            exclude_senior=True,
+        )
+        if not matched2 or not matched_role2:
+            continue
+
+        job_id = stable_job_dedupe_key(opening_title, company, apply_link_norm)
+        job_row = job_dict_for_sheet(
+            title=opening_title,
+            company=company or event_domain,
+            location=location or "",
+            job_type=job_type or "",
+            posted_date=str(snippet.get("posted_date") or posted_date_hint or ""),
+            apply_link=apply_link_norm,
+            description=description,
+            matched_role=matched_role2,
+            match_score=float(match_score or 0),
+            source_url=event_url,
+        )
+        job_row["job_id"] = job_id
+
+        url_based_qualified_jobs.append(job_row)
+
+        if job_id in url_based_seen_ids:
+            continue
+
+        if state_mgr.is_new_job(job_id):
+            url_based_seen_ids.add(job_id)
+            url_based_new_jobs.append(job_row)
+            url_based_new_job_ids.append(job_id)
         if len(url_based_new_jobs) >= details_fetch_cap:
             break
 
@@ -1370,7 +1928,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
             new_jobs = []
 
     # Local audit output (title + description + link).
-    if new_jobs:
+    if new_jobs and not args.dry_run:
         try:
             output_dir = os.path.join(SCRIPT_DIR, "job_outputs")
             os.makedirs(output_dir, exist_ok=True)
@@ -1405,39 +1963,106 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
     print("  EXTRACTED JOB RESULTS")
     print(f"  Qualified jobs     : {len(all_qualified_jobs)}")
     print(f"  New (not notified) : {len(new_jobs)}")
+    print(f"  NEW (job-diff)     : {len(new_jobs_for_sheet)}")
+    print(f"  UPDATED (job-diff) : {len(updated_jobs_for_sheet)}")
+    print(f"  CLOSED (job-diff)  : {len(closed_jobs_for_sheet)}")
     print("=" * 60 + "\n")
 
-    # 6. Notify (links.txt changes first, then JSearch jobs)
-    if url_change_events or new_jobs:
+    sites_total = len(site_outcomes)
+    sites_success = sum(1 for item in site_outcomes if bool(item.get("ok")))
+    sites_failed = max(0, sites_total - sites_success)
+    jobs_found_total = sum(int(item.get("jobs_count", 0) or 0) for item in site_outcomes)
+    jobs_added_count = len(new_jobs_for_sheet)
+    jobs_closed_count = len(closed_jobs_for_sheet)
+
+    print("=" * 60)
+    print("  SCRAPER SUCCESS METRICS")
+    print(f"  Sites scraped: {sites_total}")
+    print(f"  Success: {sites_success}")
+    print(f"  Failed: {sites_failed}")
+    print(f"  Jobs found: {jobs_found_total}")
+    print(f"  Jobs added: {jobs_added_count}")
+    print(f"  Jobs closed: {jobs_closed_count}")
+    print("=" * 60 + "\n")
+
+    if args.dry_run:
+        simulated = SheetWriter(
+            getattr(notifier, "_sheets", None) if notifier is not None else None
+        ).simulate_counts(
+            new_jobs=new_jobs_for_sheet,
+            updated_jobs=updated_jobs_for_sheet,
+            active_jobs=active_jobs_for_sheet,
+            company_jobs=company_jobs_for_sheet,
+            closed_jobs=closed_jobs_for_sheet,
+            delete_closed_rows=delete_closed_rows,
+        )
+        log.info(
+            "DRY RUN sheet simulation: new=%d, updated=%d, all_snapshot=%d, associate=%d, company_rows=%d, closed=%d, deleted=%d",
+            simulated["new_openings"],
+            len(updated_jobs_for_sheet),
+            simulated["all_openings_snapshot"],
+            simulated["associate_openings"],
+            simulated["company_sheet_rows"],
+            simulated["closed_openings"],
+            simulated["deleted_rows"],
+        )
+        if delete_closed_rows and closed_jobs_for_sheet:
+            log.info("Would remove closed jobs:")
+            for item in closed_jobs_for_sheet:
+                log.info("%s — %s", str(item.get("title") or "(unknown title)"), str(item.get("company") or "(unknown company)"))
+        elif (not delete_closed_rows) and closed_jobs_for_sheet:
+            log.info("Append-only mode enabled; would track %d closed jobs without deleting rows.", len(closed_jobs_for_sheet))
+        log.info("Skipped closure (missing_count < threshold): %d", skipped_missing_threshold)
+    else:
+        sheet_writer = SheetWriter(getattr(notifier, "_sheets", None) if notifier is not None else None)
+        write_counts = sheet_writer.write(
+            new_jobs=new_jobs_for_sheet,
+            updated_jobs=updated_jobs_for_sheet,
+            active_jobs=active_jobs_for_sheet,
+            company_jobs=company_jobs_for_sheet,
+            closed_jobs=closed_jobs_for_sheet,
+            delete_closed_rows=delete_closed_rows,
+            run_metadata=run_metadata,
+        )
+        log.info(
+            "Sheet write summary: all_openings=%d, new_openings=%d, associates=%d, company_rows=%d, closed=%d, removed_total=%d",
+            write_counts.get("all_openings", 0),
+            write_counts.get("new_openings", 0),
+            write_counts.get("associate_roles", 0),
+            write_counts.get("company_rows", 0),
+            write_counts.get("closed_openings", 0),
+            write_counts.get("removed_total", 0),
+        )
+        log.info("Jobs removed: %d", write_counts.get("removed_total", 0))
+        log.info("Associate removed: %d", write_counts.get("removed_associate", 0))
+        log.info("Skipped closure (missing_count < threshold): %d", skipped_missing_threshold)
+
+        if not delete_closed_rows and closed_jobs_for_sheet:
+            log.info("Append-only mode active; deletion skipped for %d newly closed jobs.", len(closed_jobs_for_sheet))
+        else:
+            removed_by_company: dict[str, int] = {}
+            for item in closed_jobs_for_sheet:
+                company_name = str(item.get("company") or "").strip() or "Unknown"
+                removed_by_company[company_name] = removed_by_company.get(company_name, 0) + 1
+            for company_name, count in sorted(removed_by_company.items()):
+                log.info("Company: %s, removed: %d", company_name, count)
+
+    # 6. Notify (job alerts only)
+    if new_jobs:
         if args.dry_run:
-            log.info("DRY RUN: would notify %d URL changes + %d new jobs.",
-                     len(url_change_events), len(new_jobs))
+            log.info("DRY RUN: would notify %d new jobs.", len(new_jobs))
         elif notifier is not None:
             try:
-                if url_change_events:
-                    # Mission mode: avoid noisy "URL changes / Career Openings Log"
-                    # writes when we only want validated job postings.
-                    _run_async(
-                        _notify_url_changes_async(
-                            notifier,
-                            url_change_events,
-                            record_to_sheets=_as_bool(
-                                config.get("record_url_changes_to_sheets", False),
-                                default=False,
-                            ),
-                        )
-                    )
                 if new_jobs:
                     notify_result = notifier.notify_new_jobs(new_jobs)
                     # Mark as notified only if at least one channel succeeded.
                     if notify_result and any(bool(v) for v in notify_result.values()):
                         for job_id in url_based_new_job_ids:
                             state_mgr.mark_as_notified(job_id)
-                        state_mgr.save_state()
             except Exception as exc:
                 log.error("Notification pipeline crashed: %s", exc)
     else:
-        log.info("Nothing to report — no URL changes and no new job matches.")
+        log.info("Nothing to report — no new job matches.")
 
     if not args.dry_run and notifier is not None and monitor_activity_rows:
         record_search_activity = _as_bool(config.get("record_search_activity_to_sheets", True), default=True)
@@ -1447,7 +2072,14 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
             except Exception as exc:
                 log.warning("Search activity logging failed (non-fatal): %s", exc)
 
-    # 7. Search internet for additional job openings from companies in links.txt
+    # 7. Persist snapshot state (never in dry-run)
+    if not args.dry_run:
+        state_mgr.set_company_job_state(company_state_current)
+        state_mgr.set_baseline_initialized(True)
+        state_mgr.cleanup_closed_hash_records(max_age_days=int(config.get("state_closed_cleanup_days", 30)))
+        state_mgr.save_state()
+
+    # 8. Search internet for additional job openings from companies in links.txt
     if not args.dry_run:
         try:
             sheets_client = None
@@ -1464,6 +2096,7 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
                         _search_internet_for_companies_async(
                             sheets_client=sheets_client,
                             links_file=LINKS_FILE,
+                            allowed_companies_file=os.path.join(SCRIPT_DIR, "companies_pakistan.txt"),
                             max_companies=int(config.get("internet_search_max_companies", 15)),
                             max_results_per_company=int(config.get("internet_search_max_results_per_company", 3)),
                         )
@@ -1487,10 +2120,19 @@ def run_repeating_pipeline(
 
     while True:
         cycles += 1
-        try:
-            run_once_callable(cycles)
-        except Exception as exc:
-            log.error("Cycle #%d failed unexpectedly: %s", cycles, exc, exc_info=True)
+        lock_token = _acquire_monitor_lock()
+        if lock_token is None:
+            log.warning(
+                "monitor.lock is present — another run is still executing. Skipping cycle #%d.",
+                cycles,
+            )
+        else:
+            try:
+                run_once_callable(cycles)
+            except Exception as exc:
+                log.error("Cycle #%d failed unexpectedly: %s", cycles, exc, exc_info=True)
+            finally:
+                _release_monitor_lock(lock_token)
 
         if interval <= 0:
             break
@@ -1624,6 +2266,11 @@ def main() -> None:
         help="Repeat monitor run every N hours (e.g., 12 for twice daily).",
     )
     parser.add_argument(
+        "--daemon-6h",
+        action="store_true",
+        help="Run continuously with a fixed 6-hour scheduler interval.",
+    )
+    parser.add_argument(
         "--max-cycles",
         type=int,
         default=0,
@@ -1636,6 +2283,9 @@ def main() -> None:
         help="Test scraping a single URL: extract and role-filter openings, print results, then exit.",
     )
     args = parser.parse_args()
+
+    if args.daemon_6h and args.every_hours <= 0:
+        args.every_hours = 6.0
 
     if args.every_hours > 0 and (args.test_mode or args.health_check_only):
         log.info("Ignoring --every-hours in test/health-check mode (single cycle only).")
