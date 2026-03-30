@@ -534,6 +534,85 @@ def _as_bool(value: object, default: bool = False) -> bool:
     return default
 
 
+def _domain_key(url: str) -> str:
+    try:
+        host = (urlparse(url).netloc or "").lower().strip()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _dedupe_fallback_urls(
+    fallback_urls: list[str],
+    primary_urls: list[str],
+    already_scraped_urls: list[str],
+) -> list[str]:
+    """Dedupe fallback URLs against primary/already-scraped URLs and same-domain variants."""
+    existing_urls: set[str] = set()
+    existing_domains: set[str] = set()
+
+    for raw in [*primary_urls, *already_scraped_urls]:
+        canonical = normalize_url(str(raw or "").strip())
+        if not canonical:
+            continue
+        existing_urls.add(canonical)
+        domain = _domain_key(canonical)
+        if domain:
+            existing_domains.add(domain)
+
+    deduped: list[str] = []
+    seen_new_urls: set[str] = set()
+    seen_new_domains: set[str] = set()
+
+    for raw in fallback_urls:
+        canonical = normalize_url(str(raw or "").strip())
+        if not canonical:
+            continue
+        domain = _domain_key(canonical)
+
+        if canonical in existing_urls:
+            continue
+        if canonical in seen_new_urls:
+            continue
+        if domain and (domain in existing_domains or domain in seen_new_domains):
+            continue
+
+        seen_new_urls.add(canonical)
+        if domain:
+            seen_new_domains.add(domain)
+        deduped.append(canonical)
+
+    return deduped
+
+
+def _merge_company_states(base_state: dict[str, dict], extra_state: dict[str, dict]) -> dict[str, dict]:
+    """Merge company snapshot maps by unioning job hashes per company."""
+    merged: dict[str, dict] = copy.deepcopy(base_state or {})
+    for company_key, payload in (extra_state or {}).items():
+        if not isinstance(company_key, str) or not isinstance(payload, dict):
+            continue
+
+        incoming_jobs = payload.get("jobs") if isinstance(payload.get("jobs"), dict) else {}
+        incoming_url = str(payload.get("url") or "")
+
+        if company_key not in merged or not isinstance(merged.get(company_key), dict):
+            merged[company_key] = {
+                "url": incoming_url,
+                "jobs": dict(incoming_jobs),
+            }
+            continue
+
+        existing_payload = merged[company_key]
+        existing_jobs = existing_payload.get("jobs") if isinstance(existing_payload.get("jobs"), dict) else {}
+        existing_payload["jobs"] = {**existing_jobs, **incoming_jobs}
+        if incoming_url and not str(existing_payload.get("url") or ""):
+            existing_payload["url"] = incoming_url
+
+    return merged
+
+
 def _run_async(coro):
     """Run async coroutines safely from sync entry-points."""
     try:
@@ -1261,6 +1340,13 @@ async def _search_internet_for_companies_async(
     allowed_companies_file: str,
     max_companies: int = 20,
     max_results_per_company: int = 3,
+    timeout_seconds: int = 8,
+    query_variants_limit: int = 4,
+    provider_fail_threshold: int = 3,
+    provider_block_cooldown_seconds: int = 1800,
+    enable_bing_fallback: bool = True,
+    max_empty_companies_before_abort: int = 5,
+    inter_company_delay_seconds: float = 0.5,
 ) -> bool:
     """Search internet for job openings from companies in links.txt and log to Google Sheets."""
     if sheets_client is None or search_internet_for_companies is None:
@@ -1276,8 +1362,14 @@ async def _search_internet_for_companies_async(
             links_file,
             max_companies,
             max_results_per_company,
-            int(10),
+            max(3, int(timeout_seconds)),
             allowed_companies_file,
+            max(1, int(query_variants_limit)),
+            max(1, int(provider_fail_threshold)),
+            max(60, int(provider_block_cooldown_seconds)),
+            bool(enable_bing_fallback),
+            max(1, int(max_empty_companies_before_abort)),
+            max(0.0, float(inter_company_delay_seconds)),
         )
 
         if not results:
@@ -1567,9 +1659,9 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
 
     all_qualified_jobs = []
 
-    # 5. Run links.txt job snapshot monitor (job-level hash diff) + JSearch queries
+    # 5. Run links.txt as PRIMARY job snapshot source.
     monitor_urls_list = monitored_urls
-    company_state_current, monitor_activity_rows, site_outcomes = _run_async(
+    primary_company_state, primary_activity_rows, primary_site_outcomes = _run_async(
         _collect_company_snapshots_async(
             urls=monitor_urls_list,
             timeout_seconds=int(config.get("scraper_timeout_seconds", 15)),
@@ -1586,6 +1678,79 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
             concurrency=max(1, int(config.get("url_monitor_async_concurrency", 5))),
         )
     )
+
+    primary_jobs_found = sum(int(item.get("jobs_count", 0) or 0) for item in primary_site_outcomes)
+    log.info("Primary scraping jobs: %d", primary_jobs_found)
+
+    company_state_current = primary_company_state
+    monitor_activity_rows = list(primary_activity_rows)
+    site_outcomes = list(primary_site_outcomes)
+
+    enable_internet_fallback = _as_bool(config.get("enable_internet_fallback", True), default=True)
+    min_expected_jobs = max(0, int(config.get("min_expected_jobs", 5)))
+
+    fallback_jobs_found = 0
+    fallback_discovered_urls: list[str] = []
+
+    if (
+        enable_internet_fallback
+        and search_internet_for_companies is not None
+        and primary_jobs_found < min_expected_jobs
+    ):
+        log.info("Running fallback search...")
+        raw_fallback_urls = _run_async(
+            asyncio.to_thread(
+                search_internet_for_companies,
+                LINKS_FILE,
+                int(config.get("internet_search_max_companies", 8)),
+                int(config.get("internet_search_max_results_per_company", 2)),
+                max(3, int(config.get("internet_search_timeout_seconds", 8))),
+                os.path.join(SCRIPT_DIR, "companies_pakistan.txt"),
+                max(1, int(config.get("internet_search_query_variants_limit", 5))),
+                max(1, int(config.get("internet_search_provider_fail_threshold", 3))),
+                max(60, int(config.get("internet_search_provider_block_cooldown_seconds", 1800))),
+                _as_bool(config.get("internet_search_enable_bing_fallback", True), default=True),
+                max(1, int(config.get("internet_search_max_empty_companies_before_abort", 5))),
+                max(0.0, float(config.get("internet_search_inter_company_delay_seconds", 0.5))),
+            )
+        )
+        fallback_discovered_urls = _dedupe_fallback_urls(
+            fallback_urls=raw_fallback_urls if isinstance(raw_fallback_urls, list) else [],
+            primary_urls=monitor_urls_list,
+            already_scraped_urls=[item.get("url", "") for item in primary_site_outcomes if isinstance(item, dict)],
+        )
+        log.info("Fallback URLs found: %d", len(fallback_discovered_urls))
+
+        if fallback_discovered_urls:
+            fallback_company_state, fallback_activity_rows, fallback_site_outcomes = _run_async(
+                _collect_company_snapshots_async(
+                    urls=fallback_discovered_urls,
+                    timeout_seconds=int(config.get("scraper_timeout_seconds", 15)),
+                    max_pages_per_site=int(config.get("link_scraper_max_pages", 8)),
+                    max_openings_per_site=min(
+                        int(config.get("max_jobs_per_site", 50)),
+                        int(
+                            config.get(
+                                "link_scraper_max_openings_per_site",
+                                config.get("playwright_max_openings_per_page", 80),
+                            )
+                        ),
+                    ),
+                    concurrency=max(1, int(config.get("url_monitor_async_concurrency", 5))),
+                )
+            )
+            fallback_jobs_found = sum(int(item.get("jobs_count", 0) or 0) for item in fallback_site_outcomes)
+            log.info("Fallback jobs found: %d", fallback_jobs_found)
+
+            company_state_current = _merge_company_states(company_state_current, fallback_company_state)
+            monitor_activity_rows.extend(fallback_activity_rows)
+            site_outcomes.extend(fallback_site_outcomes)
+        else:
+            log.info("Fallback jobs found: 0")
+    elif enable_internet_fallback:
+        log.info("Fallback skipped: primary jobs (%d) reached threshold (%d).", primary_jobs_found, min_expected_jobs)
+
+    log.info("Total jobs: %d", primary_jobs_found + fallback_jobs_found)
 
     for row in monitor_activity_rows:
         if isinstance(row, dict):
@@ -2078,31 +2243,6 @@ def _run_single_cycle(args: argparse.Namespace, cycle_number: int = 1) -> None:
         state_mgr.set_baseline_initialized(True)
         state_mgr.cleanup_closed_hash_records(max_age_days=int(config.get("state_closed_cleanup_days", 30)))
         state_mgr.save_state()
-
-    # 8. Search internet for additional job openings from companies in links.txt
-    if not args.dry_run:
-        try:
-            sheets_client = None
-            if notifier is not None and hasattr(notifier, "_sheets"):
-                sheets_client = notifier._sheets
-
-            if sheets_client is not None:
-                enable_internet_search = _as_bool(
-                    config.get("enable_internet_company_search", True),
-                    default=True,
-                )
-                if enable_internet_search:
-                    _run_async(
-                        _search_internet_for_companies_async(
-                            sheets_client=sheets_client,
-                            links_file=LINKS_FILE,
-                            allowed_companies_file=os.path.join(SCRIPT_DIR, "companies_pakistan.txt"),
-                            max_companies=int(config.get("internet_search_max_companies", 15)),
-                            max_results_per_company=int(config.get("internet_search_max_results_per_company", 3)),
-                        )
-                    )
-        except Exception as exc:
-            log.warning("Internet company search failed (non-fatal): %s", exc)
 
     log.info("Job Monitor cycle #%d finished.", cycle_number)
 

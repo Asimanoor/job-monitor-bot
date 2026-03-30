@@ -10,13 +10,20 @@ No external NLP models — runs in <1 second.
 from __future__ import annotations
 
 import os
+import inspect
 import logging
 import re
+import threading
 from typing import Any
 
 from thefuzz import fuzz
 
 log = logging.getLogger(__name__)
+
+_SEMANTIC_MODEL_CACHE: dict[str, Any] = {}
+_SEMANTIC_ROLE_EMBEDDINGS_CACHE: dict[tuple[str, tuple[str, ...]], Any] = {}
+_SEMANTIC_CACHE_LOCK = threading.Lock()
+_SEMANTIC_WARNED_ONCE = False
 
 # ── Target roles ─────────────────────────────────────────────────────────────
 # These are loaded from jobs.txt at runtime, but we keep defaults for fallback.
@@ -155,6 +162,13 @@ def _word_boundary_match(text: str, keywords: list[str]) -> str | None:
         if re.search(pattern, text_lower):
             return kw
     return None
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def is_non_job_title(title: str) -> bool:
@@ -311,7 +325,9 @@ def matches_target_role(
             if use_semantic is None
             else bool(use_semantic)
         )
-        if enabled:
+        # Semantic filtering should only run when we have meaningful body text.
+        # Title-only checks are handled by keyword/fuzzy rules above.
+        if enabled and len((description or "").strip()) >= 40:
             semantic_ok = passes_semantic_filter(
                 title=title,
                 description=description,
@@ -363,36 +379,76 @@ def passes_semantic_filter(
         # No dependency / model not available: don't block keyword matches.
         return True
 
+    # Keep third-party model download logs from flooding monitor output.
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+    logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+
     model_name = os.environ.get("SEMANTIC_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 
-    # Lazy global cache to avoid re-downloading/loading.
-    global _SEMANTIC_MODEL_CACHE  # noqa: PLW0603
-    global _SEMANTIC_ROLE_EMBEDDINGS_CACHE  # noqa: PLW0603
-    try:
-        _SEMANTIC_MODEL_CACHE
-    except NameError:
-        _SEMANTIC_MODEL_CACHE = {}  # type: ignore
-    try:
-        _SEMANTIC_ROLE_EMBEDDINGS_CACHE
-    except NameError:
-        _SEMANTIC_ROLE_EMBEDDINGS_CACHE = {}  # type: ignore
+    global _SEMANTIC_WARNED_ONCE
 
-    model = _SEMANTIC_MODEL_CACHE.get(model_name)
-    if model is None:
-        model = SentenceTransformer(model_name)
-        _SEMANTIC_MODEL_CACHE[model_name] = model
+    with _SEMANTIC_CACHE_LOCK:
+        model = _SEMANTIC_MODEL_CACHE.get(model_name)
+        if model is None:
+            kwargs: dict[str, Any] = {}
+            try:
+                signature_params = inspect.signature(SentenceTransformer).parameters
+            except Exception:
+                signature_params = {}
 
-    # Cache role embeddings by model+roles content.
-    roles_key = (model_name, tuple(target_roles))
-    role_embeddings = _SEMANTIC_ROLE_EMBEDDINGS_CACHE.get(roles_key)
-    if role_embeddings is None:
-        role_embeddings = model.encode(target_roles, convert_to_tensor=True)
-        _SEMANTIC_ROLE_EMBEDDINGS_CACHE[roles_key] = role_embeddings
+            hf_token = os.environ.get("HF_TOKEN", "").strip()
+            if hf_token:
+                if "token" in signature_params:
+                    kwargs["token"] = hf_token
+                elif "use_auth_token" in signature_params:
+                    kwargs["use_auth_token"] = hf_token
 
-    job_text = f"{title} {description[:250]}".strip()
-    job_embedding = model.encode(job_text, convert_to_tensor=True)
-    similarities = util.cos_sim(job_embedding, role_embeddings)[0]
-    max_sim = float(similarities.max().item()) if hasattr(similarities.max(), "item") else float(similarities.max())
+            if _env_truthy("SEMANTIC_LOCAL_FILES_ONLY", default=False) and "local_files_only" in signature_params:
+                kwargs["local_files_only"] = True
+
+            try:
+                model = SentenceTransformer(model_name, **kwargs)
+            except Exception as exc:
+                if not _SEMANTIC_WARNED_ONCE:
+                    log.warning(
+                        "Semantic filter unavailable (%s). Falling back to keyword/fuzzy-only matching.",
+                        exc,
+                    )
+                    _SEMANTIC_WARNED_ONCE = True
+                return True
+
+            _SEMANTIC_MODEL_CACHE[model_name] = model
+
+        roles_key = (model_name, tuple(target_roles))
+        role_embeddings = _SEMANTIC_ROLE_EMBEDDINGS_CACHE.get(roles_key)
+        if role_embeddings is None:
+            try:
+                role_embeddings = model.encode(target_roles, convert_to_tensor=True)
+            except Exception as exc:
+                if not _SEMANTIC_WARNED_ONCE:
+                    log.warning(
+                        "Semantic role embedding failed (%s). Falling back to keyword/fuzzy-only matching.",
+                        exc,
+                    )
+                    _SEMANTIC_WARNED_ONCE = True
+                return True
+            _SEMANTIC_ROLE_EMBEDDINGS_CACHE[roles_key] = role_embeddings
+
+        try:
+            job_text = f"{title} {description[:250]}".strip()
+            job_embedding = model.encode(job_text, convert_to_tensor=True)
+            similarities = util.cos_sim(job_embedding, role_embeddings)[0]
+            max_sim = float(similarities.max().item()) if hasattr(similarities.max(), "item") else float(similarities.max())
+        except Exception as exc:
+            if not _SEMANTIC_WARNED_ONCE:
+                log.warning(
+                    "Semantic scoring failed (%s). Falling back to keyword/fuzzy-only matching.",
+                    exc,
+                )
+                _SEMANTIC_WARNED_ONCE = True
+            return True
+
     return max_sim >= float(threshold)
 
 

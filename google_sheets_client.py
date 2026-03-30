@@ -1457,7 +1457,8 @@ class GoogleSheetsClient:
     def health_check(self) -> bool:
         """Quick check: can we read the sheet title? Returns True/False."""
         try:
-            _ = self._retry_on_quota(self._ws.title)
+            # Probe a tiny range so we exercise real API connectivity.
+            _ = self._retry_on_quota(self._ws.get, "A1")
             return True
         except Exception as exc:
             log.error("Sheets health check failed: %s", exc)

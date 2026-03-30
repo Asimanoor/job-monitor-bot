@@ -109,9 +109,16 @@ COMPANY_TARGETED_MAX_QUERIES_PER_RUN=4
 LINK_SCRAPER_MAX_PAGES=8
 LINK_SCRAPER_MAX_OPENINGS_PER_SITE=300
 PLAYWRIGHT_MAX_OPENINGS_PER_PAGE=120
-ENABLE_INTERNET_COMPANY_SEARCH=true
-INTERNET_SEARCH_MAX_COMPANIES=15
-INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY=3
+ENABLE_INTERNET_COMPANY_SEARCH=false
+INTERNET_SEARCH_MAX_COMPANIES=8
+INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY=2
+INTERNET_SEARCH_TIMEOUT_SECONDS=8
+INTERNET_SEARCH_QUERY_VARIANTS_LIMIT=4
+INTERNET_SEARCH_PROVIDER_FAIL_THRESHOLD=3
+INTERNET_SEARCH_PROVIDER_BLOCK_COOLDOWN_SECONDS=1800
+INTERNET_SEARCH_ENABLE_BING_FALLBACK=true
+INTERNET_SEARCH_MAX_EMPTY_COMPANIES_BEFORE_ABORT=5
+INTERNET_SEARCH_INTER_COMPANY_DELAY_SECONDS=0.5
 RECORD_URL_CHANGES_TO_SHEETS=true
 RECORD_SEARCH_ACTIVITY_TO_SHEETS=true
 HF_TOKEN=optional_huggingface_token
@@ -168,7 +175,7 @@ Create `pause.txt` in the repo root to pause the bot. Delete it to resume.
 
 | Workflow | Schedule | Purpose |
 |---|---|---|
-| `job_monitor.yml` | Every 6 hours | URL change monitoring (links.txt) + internet job search + Sheets logging |
+| `job_monitor.yml` | Every 6 hours | URL change monitoring (links.txt) + Sheets logging (optional internet search can be enabled) |
 | `weekly_report.yml` | Sunday 9 AM PKT | Weekly summary + archive |
 
 ### Required Secrets
@@ -204,9 +211,16 @@ The bot automatically searches the internet for job openings from companies in `
 5. Appends to Google Sheets `Career Openings Log` worksheet
 
 Configuration:
-- `ENABLE_INTERNET_COMPANY_SEARCH` (default: true)
-- `INTERNET_SEARCH_MAX_COMPANIES` (default: 15)
-- `INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY` (default: 3)
+- `ENABLE_INTERNET_COMPANY_SEARCH` (default: false)
+- `INTERNET_SEARCH_MAX_COMPANIES` (default: 8)
+- `INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY` (default: 2)
+- `INTERNET_SEARCH_TIMEOUT_SECONDS` (default: 8)
+- `INTERNET_SEARCH_QUERY_VARIANTS_LIMIT` (default: 4)
+- `INTERNET_SEARCH_PROVIDER_FAIL_THRESHOLD` (default: 3)
+- `INTERNET_SEARCH_PROVIDER_BLOCK_COOLDOWN_SECONDS` (default: 1800)
+- `INTERNET_SEARCH_ENABLE_BING_FALLBACK` (default: true)
+- `INTERNET_SEARCH_MAX_EMPTY_COMPANIES_BEFORE_ABORT` (default: 5)
+- `INTERNET_SEARCH_INTER_COMPANY_DELAY_SECONDS` (default: 0.5)
 - `RECORD_URL_CHANGES_TO_SHEETS` (default: true)
 - `RECORD_SEARCH_ACTIVITY_TO_SHEETS` (default: true)
 

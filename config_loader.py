@@ -52,6 +52,20 @@ class ConfigLoader:
             "url_change_max_openings_per_event": 300,
             "url_change_max_openings_per_cycle": 5000,
             "url_change_log_baseline_openings": True,
+            # Internet fallback is only used when primary links.txt scraping is low.
+            "enable_internet_fallback": True,
+            "min_expected_jobs": 5,
+            # Legacy flag retained for backwards compatibility.
+            "enable_internet_company_search": False,
+            "internet_search_max_companies": 8,
+            "internet_search_max_results_per_company": 2,
+            "internet_search_timeout_seconds": 8,
+            "internet_search_query_variants_limit": 4,
+            "internet_search_provider_fail_threshold": 3,
+            "internet_search_provider_block_cooldown_seconds": 1800,
+            "internet_search_enable_bing_fallback": True,
+            "internet_search_max_empty_companies_before_abort": 5,
+            "internet_search_inter_company_delay_seconds": 0.5,
             # Persist URL change/opening logs to dedicated worksheets.
             "record_url_changes_to_sheets": True,
             # Write per-URL monitoring audit (searched/changed/ignored/error) to
@@ -292,6 +306,63 @@ class ConfigLoader:
         if "SCRAPER_TIMEOUT_SECONDS" in os.environ:
             try:
                 self.config["scraper_timeout_seconds"] = int(os.environ["SCRAPER_TIMEOUT_SECONDS"])
+            except ValueError:
+                pass
+        if "ENABLE_INTERNET_COMPANY_SEARCH" in os.environ:
+            self.config["enable_internet_company_search"] = os.environ["ENABLE_INTERNET_COMPANY_SEARCH"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "ENABLE_INTERNET_FALLBACK" in os.environ:
+            self.config["enable_internet_fallback"] = os.environ["ENABLE_INTERNET_FALLBACK"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "MIN_EXPECTED_JOBS" in os.environ:
+            try:
+                self.config["min_expected_jobs"] = int(os.environ["MIN_EXPECTED_JOBS"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_MAX_COMPANIES" in os.environ:
+            try:
+                self.config["internet_search_max_companies"] = int(os.environ["INTERNET_SEARCH_MAX_COMPANIES"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY" in os.environ:
+            try:
+                self.config["internet_search_max_results_per_company"] = int(os.environ["INTERNET_SEARCH_MAX_RESULTS_PER_COMPANY"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_TIMEOUT_SECONDS" in os.environ:
+            try:
+                self.config["internet_search_timeout_seconds"] = int(os.environ["INTERNET_SEARCH_TIMEOUT_SECONDS"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_QUERY_VARIANTS_LIMIT" in os.environ:
+            try:
+                self.config["internet_search_query_variants_limit"] = int(os.environ["INTERNET_SEARCH_QUERY_VARIANTS_LIMIT"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_PROVIDER_FAIL_THRESHOLD" in os.environ:
+            try:
+                self.config["internet_search_provider_fail_threshold"] = int(os.environ["INTERNET_SEARCH_PROVIDER_FAIL_THRESHOLD"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_PROVIDER_BLOCK_COOLDOWN_SECONDS" in os.environ:
+            try:
+                self.config["internet_search_provider_block_cooldown_seconds"] = int(os.environ["INTERNET_SEARCH_PROVIDER_BLOCK_COOLDOWN_SECONDS"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_ENABLE_BING_FALLBACK" in os.environ:
+            self.config["internet_search_enable_bing_fallback"] = os.environ["INTERNET_SEARCH_ENABLE_BING_FALLBACK"].strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        if "INTERNET_SEARCH_MAX_EMPTY_COMPANIES_BEFORE_ABORT" in os.environ:
+            try:
+                self.config["internet_search_max_empty_companies_before_abort"] = int(os.environ["INTERNET_SEARCH_MAX_EMPTY_COMPANIES_BEFORE_ABORT"])
+            except ValueError:
+                pass
+        if "INTERNET_SEARCH_INTER_COMPANY_DELAY_SECONDS" in os.environ:
+            try:
+                self.config["internet_search_inter_company_delay_seconds"] = float(os.environ["INTERNET_SEARCH_INTER_COMPANY_DELAY_SECONDS"])
             except ValueError:
                 pass
 
